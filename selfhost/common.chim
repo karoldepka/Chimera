@@ -1,0 +1,176 @@
+// Helpers shared by the backends (self-hosted). Port of src/common.rs.
+
+class Decls(val decls: Vec<Decl>) {
+  var funs: Map<String, FunDecl> = {}
+  var classes: Map<String, ClassDecl> = {}
+  var enums: Vec<EnumDecl> = []
+  var methods: Vec<MethodDecl> = []
+
+  fun index(): Decls {
+    for d in decls {
+      match d {
+        DFun(f) => { funs = funs.assoc(f.name, f) }
+        DClass(c) => { classes = classes.assoc(c.name, c) }
+        DEnum(e) => { enums = enums.push(e) }
+        DMethod(m) => { methods = methods.push(m) }
+        _ => {}
+      }
+    }
+    this
+  }
+}
+
+/// Order call arguments by parameter; nil means "use the default".
+fun orderArgs(params: Vec<Param>, args: Vec<Arg>): Vec<Any> {
+  val positional = args.filter(|a| a.name == nil).count()
+  val len = if params.count() > positional { params.count() } else { positional }
+  var out: Vec<Any> = []
+  for k in 0..len { out = out.push(nil) }
+  var pos = 0
+  for a in args {
+    if a.name != nil {
+      var k = 0
+      while k < params.count() {
+        if (params[k]!!).name == a.name { out = out.assoc(k, a.value); break }
+        k += 1
+      }
+    } else {
+      if pos < out.count() { out = out.assoc(pos, a.value) }
+      pos += 1
+    }
+  }
+  out
+}
+
+/// Visit each direct child expression (statements inside blocks included).
+fun walk(e: Expr, f: (Expr) -> Unit) {
+  match e.kind {
+    EStr(segs) => { for s in segs { match s { SegExpr(x) => f(x), _ => {} } } }
+    EOld(x, _) => f(x)
+    EUnary(_, x) => f(x)
+    EPercent(x) => f(x)
+    ETry(x) => f(x)
+    ENotNull(x) => f(x)
+    EIs(x, _) => f(x)
+    EQuantity(x, _) => f(x)
+    EBinary(_, l, r) => { f(l); f(r) }
+    EIndex(l, r) => { f(l); f(r) }
+    ERange(l, r) => { f(l); f(r) }
+    EThread(_, l, r) => { f(l); f(r) }
+    ECall(c, args) => { f(c); for a in args { f(a.value) } }
+    EMember(obj, _, _) => f(obj)
+    ESuper(_, _, args) => { for a in args { f(a.value) } }
+    ELambda(_, b) => f(b)
+    EIf(c, t, el) => { f(c); walkStmts(t.stmts, f); if el != nil { walkStmts(el!!.stmts, f) } }
+    EMatch(s, arms) => { f(s); for a in arms { if a.guard != nil { f(a.guard!!) }; f(a.body) } }
+    EVec(items) => { for i in items { f(i) } }
+    EMap(es) => { for en in es { match en { MSpread(x) => f(x), MKv(k, v) => { f(k); f(v) } } } }
+    EBlock(b) => walkStmts(b.stmts, f)
+    ESheet(cells) => { for c in cells { f(c.value) } }
+    _ => {}
+  }
+}
+
+fun walkStmts(ss: Vec<Stmt>, f: (Expr) -> Unit) {
+  for s in ss {
+    match s {
+      SLet(_, _, _, init, _) => f(init)
+      SAssign(t, _, v, _) => { f(t); f(v) }
+      SExpr(x) => f(x)
+      SReturn(v, _) => { if v != nil { f(v!!) } }
+      SWhile(c, b) => { f(c); walkStmts(b.stmts, f) }
+      SFor(_, it, b) => { f(it); walkStmts(b.stmts, f) }
+      _ => {}
+    }
+  }
+}
+
+class NameAcc {
+  var names: Map<String, Bool> = {}
+  var usesThis: Bool = false
+  fun add(n: String) { names = names.assoc(n, true) }
+}
+
+/// Names referenced anywhere inside an expression (closure captures).
+fun freeNames(e: Expr, acc: NameAcc) {
+  match e.kind {
+    EIdent(n) => { acc.add(n); acc.usesThis = true }
+    EThis => { acc.usesThis = true }
+    ESuper(_, _, _) => { acc.usesThis = true }
+    ECall(c, _) => {
+      match c.kind {
+        EIdent(n) => { acc.add(n); if n == "callNext" { acc.add("__args") } }
+        _ => {}
+      }
+      acc.usesThis = true
+    }
+    _ => {}
+  }
+  walk(e, |x| freeNames(x, acc))
+}
+
+/// A sheet cell that references cells or calls a function is a formula.
+fun isFormula(e: Expr): Bool {
+  val found = NameAcc()
+  formulaGo(e, found)
+  found.usesThis
+}
+fun formulaGo(e: Expr, found: NameAcc) {
+  val direct = match e.kind {
+    ECellRef(_) => true
+    ECellRange(_, _) => true
+    ECall(_, _) => true
+    EIdent(_) => true
+    _ => false
+  }
+  if direct { found.usesThis = true; return nil }
+  walk(e, |x| formulaGo(x, found))
+}
+
+fun contractMsg(kind: String, where_: String, c: Contract): String =
+  if c.tag != nil { "$kind '${c.tag}' violated in $where_: ${c.text}" } else { "$kind violated in $where_: ${c.text}" }
+
+// ---- Rust source helpers
+
+fun rustKeywords(): Vec<String> = [
+  "as", "async", "await", "box", "const", "crate", "dyn", "enum", "extern", "fn", "impl", "let", "loop", "mod", "move",
+  "mut", "pub", "ref", "self", "Self", "static", "struct", "super", "trait", "type", "unsafe", "use", "where", "yield",
+  "macro", "priv", "typeof", "unsized", "virtual", "final", "do", "try", "abstract", "become", "gen"
+]
+
+fun rid(n: String): String {
+  if n == "_" { return "__unused" }
+  if n == "self" || n == "Self" || n == "super" || n == "crate" { return "${n}_" }
+  if rustKeywords().contains(n) { "r#$n" } else { n }
+}
+
+fun hexDigits(n: Int): String {
+  val digits = "0123456789abcdef".chars()
+  if n == 0 { return "0" }
+  var out = ""
+  var x = n
+  while x > 0 { out = (digits[x % 16] ?: "") & out; x = x / 16 }
+  out
+}
+
+/// Rust `{:?}` formatting of a string
+fun lit(s: String): String {
+  var out: Vec<String> = ["\""]
+  for c in s.chars() {
+    val esc = match c {
+      "\"" => "\\\""
+      "\\" => "\\\\"
+      "\n" => "\\n"
+      "\r" => "\\r"
+      "\t" => "\\t"
+      "\0" => "\\0"
+      _ => if c.code() < 32 || c.code() == 127 { "\\u{${hexDigits(c.code())}}" } else { c }
+    }
+    out = out.push(esc)
+  }
+  out = out.push("\"")
+  out.join("")
+}
+
+/// Rust `{:?}` formatting of an f64
+fun floatLit(f: Float): String = str(f)

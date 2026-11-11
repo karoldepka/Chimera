@@ -820,6 +820,7 @@ pub fn builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Value {
     match recv {
         Value::Str(st) => match name {
             "length" | "count" => Value::Int(st.chars().count() as i64),
+            "code" => Value::Int(st.chars().next().map_or(0, |c| c as i64)),
             "upper" | "uppercase" => s(&st.to_uppercase()),
             "lower" | "lowercase" => s(&st.to_lowercase()),
             "trim" => s(st.trim()),

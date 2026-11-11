@@ -1,0 +1,339 @@
+// Desugaring (self-hosted). Port of src/desugar.rs: Sheets lazy functions, threading,
+// percent literals, compound assignment and Eiffel `old(...)` slots.
+
+fun isSheetsLazy(n: String): Bool = ["IF", "IFS", "AND", "OR", "NOT", "LAMBDA", "LET", "SWITCH", "IFERROR"].contains(n)
+
+fun blk(e: Expr): Block = Block([SExpr(e)], e.span)
+fun naErr(span: Span): Expr = Expr(ECall(Expr(EIdent("Err"), span), [Arg(nil, Expr(EStr([SegLit("#N/A")]), span))]), span)
+
+class Desugar(val globals: Map<String, Bool>) {
+  var tmp: Int = 0
+  var olds: Vec<Expr> = []
+
+  fun fresh(): String { tmp += 1; "__t$tmp" }
+
+  fun program(decls: Vec<Decl>): Result<Vec<Decl>, Diag> {
+    var out: Vec<Decl> = []
+    for d in decls {
+      val nd = match d {
+        DFun(f) => DFun(fun_(f)?)
+        DClass(c) => {
+          var ms: Vec<FunDecl> = []
+          for m in c.methods { ms = ms.push(fun_(m)?) }
+          var fs: Vec<FieldDecl> = []
+          for fl in c.fields { fs = fs.push(fl.copy(init = expr(fl.init)?)) }
+          var invs: Vec<Contract> = []
+          for inv in c.invariants { invs = invs.push(inv.copy(expr = expr(inv.expr)?)) }
+          val ps = params(c.params)?
+          var sups: Vec<SuperRef> = []
+          for s in c.supers {
+            if s.args == nil { sups = sups.push(s) } else { sups = sups.push(s.copy(args = argsList(s.args!!)?)) }
+          }
+          DClass(c.copy(methods = ms, fields = fs, invariants = invs, params = ps, supers = sups))
+        }
+        DMethod(m) => DMethod(m.copy(body = expr(m.body)?))
+        _ => d
+      }
+      out = out.push(nd)
+    }
+    Ok(out)
+  }
+
+  fun params(ps: Vec<Param>): Result<Vec<Param>, Diag> {
+    var out: Vec<Param> = []
+    for p in ps { if p.dflt == nil { out = out.push(p) } else { out = out.push(p.copy(dflt = expr(p.dflt!!)?)) } }
+    Ok(out)
+  }
+
+  fun argsList(args: Vec<Arg>): Result<Vec<Arg>, Diag> {
+    var out: Vec<Arg> = []
+    for a in args { out = out.push(Arg(a.name, expr(a.value)?)) }
+    Ok(out)
+  }
+
+  fun fun_(f: FunDecl): Result<FunDecl, Diag> {
+    val ps = params(f.params)?
+    var req: Vec<Contract> = []
+    for c in f.requires { req = req.push(c.copy(expr = expr(c.expr)?)) }
+    olds = []
+    var ens: Vec<Contract> = []
+    for c in f.ensures {
+      val e1 = expr(c.expr)?
+      ens = ens.push(c.copy(expr = collectOlds(e1)))
+    }
+    val o = olds
+    val body = if f.body == nil { nil } else { expr(f.body!!)? }
+    Ok(f.copy(params = ps, requires = req, ensures = ens, body = body, olds = o))
+  }
+
+  fun collectOlds(e: Expr): Expr = match e.kind {
+    EOld(inner, _) => {
+      val slot = olds.count()
+      olds = olds.push(inner)
+      Expr(EOld(inner, slot), e.span)
+    }
+    _ => mapChildren(e, |x| collectOlds(x))
+  }
+
+  fun block(b: Block): Result<Block, Diag> {
+    var out: Vec<Stmt> = []
+    for s in b.stmts { out = out.push(stmt(s)?) }
+    Ok(Block(out, b.span))
+  }
+
+  fun stmt(s: Stmt): Result<Stmt, Diag> = match s {
+    SLet(m, n, ty, init, sp) => Ok(SLet(m, n, ty, expr(init)?, sp))
+    SAssign(target, op, value, sp) => {
+      val t = expr(target)?
+      val v = expr(value)?
+      if op != "=" {
+        val span = spanTo(t.span, v.span)
+        Ok(SAssign(t, "=", Expr(EBinary(op.substring(0, 1), t, v), span), sp))
+      } else { Ok(SAssign(t, op, v, sp)) }
+    }
+    SExpr(e) => Ok(SExpr(expr(e)?))
+    SReturn(v, sp) => if v == nil { Ok(s) } else { Ok(SReturn(expr(v!!)?, sp)) }
+    SWhile(c, b) => { val c2 = expr(c)?; Ok(SWhile(c2, block(b)?)) }
+    SFor(n, it, b) => { val it2 = expr(it)?; Ok(SFor(n, it2, block(b)?)) }
+    _ => Ok(s)
+  }
+
+  fun exprs(es: Vec<Expr>): Result<Vec<Expr>, Diag> {
+    var out: Vec<Expr> = []
+    for e in es { out = out.push(expr(e)?) }
+    Ok(out)
+  }
+
+  /// children first (in source order), then rewrite this node
+  fun children(e: Expr): Result<Expr, Diag> {
+    val sp = e.span
+    val k = match e.kind {
+      EStr(segs) => {
+        var out: Vec<StrSeg> = []
+        for s in segs {
+          match s {
+            SegExpr(x) => { out = out.push(SegExpr(expr(x)?)) }
+            _ => { out = out.push(s) }
+          }
+        }
+        EStr(out)
+      }
+      EOld(x, slot) => EOld(expr(x)?, slot)
+      EUnary(op, x) => EUnary(op, expr(x)?)
+      EPercent(x) => EPercent(expr(x)?)
+      ETry(x) => ETry(expr(x)?)
+      ENotNull(x) => ENotNull(expr(x)?)
+      EIs(x, ty) => EIs(expr(x)?, ty)
+      EQuantity(x, u) => EQuantity(expr(x)?, u)
+      EBinary(op, l, r) => { val l2 = expr(l)?; EBinary(op, l2, expr(r)?) }
+      EIndex(l, r) => { val l2 = expr(l)?; EIndex(l2, expr(r)?) }
+      ERange(l, r) => { val l2 = expr(l)?; ERange(l2, expr(r)?) }
+      EThread(op, l, r) => { val l2 = expr(l)?; EThread(op, l2, expr(r)?) }
+      ECall(c, args) => { val c2 = expr(c)?; ECall(c2, argsList(args)?) }
+      EMember(obj, n, safe) => EMember(expr(obj)?, n, safe)
+      ESuper(q, n, args) => ESuper(q, n, argsList(args)?)
+      ELambda(ps, b) => { val ps2 = params(ps)?; ELambda(ps2, expr(b)?) }
+      EIf(c, t, el) => {
+        val c2 = expr(c)?
+        val t2 = block(t)?
+        EIf(c2, t2, if el == nil { nil } else { block(el!!)? })
+      }
+      EMatch(s, arms) => {
+        val s2 = expr(s)?
+        var out: Vec<MatchArm> = []
+        for a in arms {
+          val g = if a.guard == nil { nil } else { expr(a.guard!!)? }
+          out = out.push(MatchArm(a.pat, g, expr(a.body)?, a.span))
+        }
+        EMatch(s2, out)
+      }
+      EVec(items) => EVec(exprs(items)?)
+      EMap(es) => {
+        var out: Vec<MapEntry> = []
+        for en in es {
+          match en {
+            MSpread(x) => { out = out.push(MSpread(expr(x)?)) }
+            MKv(kk, v) => { val k2 = expr(kk)?; out = out.push(MKv(k2, expr(v)?)) }
+          }
+        }
+        EMap(out)
+      }
+      EBlock(b) => EBlock(block(b)?)
+      ESheet(cells) => {
+        var out: Vec<SheetCell> = []
+        for c in cells { out = out.push(SheetCell(c.cell, expr(c.value)?, c.span)) }
+        ESheet(out)
+      }
+      _ => e.kind
+    }
+    Ok(Expr(k, sp))
+  }
+
+  fun expr(e0: Expr): Result<Expr, Diag> {
+    val e = children(e0)?
+    val span = e.span
+    match e.kind {
+      EPercent(x) => Ok(Expr(EBinary("*", x, Expr(EDecimal("0.01"), span)), span))
+      EThread(op, left, right) => match right.kind {
+        ECall(callee, cargs) => {
+          val n = match callee.kind { EIdent(nm) => nm, _ => "" }
+          val isMethod = n != "" && !globals.containsKey(n) && !isBuiltin(n) && !isSheetsLazy(n) && n.substring(0, 1) >= "a" && n.substring(0, 1) <= "z"
+          if isMethod {
+            Ok(Expr(ECall(Expr(EMember(left, n, false), span), cargs), span))
+          } else {
+            val a = Arg(nil, left)
+            val newArgs = if op == "->" { [a] + cargs } else { cargs.push(a) }
+            Ok(Expr(ECall(callee, newArgs), span))
+          }
+        }
+        _ => Ok(Expr(ECall(right, [Arg(nil, left)]), span))
+      }
+      ECall(callee, cargs) => match callee.kind {
+        EIdent(n) if isSheetsLazy(n) => Ok(Expr(sheetsLazy(n, cargs, span)?, span))
+        _ => Ok(e)
+      }
+      _ => Ok(e)
+    }
+  }
+
+  fun sheetsLazy(name: String, args: Vec<Arg>, span: Span): Result<ExprKind, Diag> {
+    var vals: Vec<Expr> = args.map(|a| a.value)
+    val n = vals.count()
+    if name == "IF" {
+      if n != 2 && n != 3 { return Err(Diag("IF expects (condition, value_if_true, [value_if_false])", span)) }
+      val els = if n == 3 { blk(vals[2]!!) } else { blk(Expr(EBool(false), span)) }
+      return Ok(EIf(vals[0]!!, blk(vals[1]!!), els))
+    }
+    if name == "IFS" {
+      if n == 0 || n % 2 != 0 { return Err(Diag("IFS expects condition/value pairs", span)) }
+      var acc = naErr(span)
+      var k = n - 1
+      while k >= 1 {
+        acc = Expr(EIf(vals[k - 1]!!, blk(vals[k]!!), blk(acc)), span)
+        k -= 2
+      }
+      return Ok(acc.kind)
+    }
+    if name == "AND" || name == "OR" {
+      if n == 0 { return Err(Diag("$name expects 1", span)) }
+      val op = if name == "AND" { "&&" } else { "||" }
+      var acc = vals[0]!!
+      for k in 1..n { acc = Expr(EBinary(op, acc, vals[k]!!), span) }
+      return Ok(acc.kind)
+    }
+    if name == "NOT" {
+      if n != 1 { return Err(Diag("NOT expects 1", span)) }
+      return Ok(EUnary("!", vals[0]!!))
+    }
+    if name == "LAMBDA" {
+      if n == 0 { return Err(Diag("LAMBDA expects 1", span)) }
+      var ps: Vec<Param> = []
+      for k in 0..(n - 1) {
+        val v = vals[k]!!
+        match v.kind {
+          EIdent(pn) => { ps = ps.push(Param(pn, nil, nil, nil, v.span)) }
+          _ => { return Err(Diag("LAMBDA parameters must be plain names", v.span)) }
+        }
+      }
+      return Ok(ELambda(ps, vals[n - 1]!!))
+    }
+    if name == "LET" {
+      if n < 3 || n % 2 == 0 { return Err(Diag("LET expects (name1, value1, [name2, value2, ...], expression)", span)) }
+      var stmts: Vec<Stmt> = []
+      var k = 0
+      while k + 1 < n - 1 + 1 && k < n - 1 {
+        val nm = vals[k]!!
+        val lname = match nm.kind {
+          EIdent(x) => x
+          _ => { return Err(Diag("LET names must be plain names", nm.span)) }
+        }
+        stmts = stmts.push(SLet(false, lname, nil, vals[k + 1]!!, nm.span))
+        k += 2
+      }
+      stmts = stmts.push(SExpr(vals[n - 1]!!))
+      return Ok(EBlock(Block(stmts, span)))
+    }
+    if name == "SWITCH" {
+      if n < 3 { return Err(Diag("SWITCH expects (expression, case1, value1, ..., [default])", span)) }
+      val t = fresh()
+      val subject = vals[0]!!
+      val rest = vals.drop(1)
+      val hasDefault = rest.count() % 2 == 1
+      var acc = if hasDefault { rest.last()!! } else { naErr(span) }
+      val pairs = if hasDefault { rest.take(rest.count() - 1) } else { rest }
+      var k = pairs.count() - 1
+      while k >= 1 {
+        val cond = Expr(EBinary("==", Expr(EIdent(t), span), pairs[k - 1]!!), span)
+        acc = Expr(EIf(cond, blk(pairs[k]!!), blk(acc)), span)
+        k -= 2
+      }
+      return Ok(EBlock(Block([SLet(false, t, nil, subject, span), SExpr(acc)], span)))
+    }
+    if name == "IFERROR" {
+      if n != 2 && n != 1 { return Err(Diag("IFERROR expects (value, [value_if_error])", span)) }
+      val fb = if n == 2 { vals[1]!! } else { Expr(EStr([SegLit("")]), span) }
+      val v = vals[0]!!
+      val t = fresh()
+      val tid = Expr(EIdent(t), span)
+      val cond = Expr(ECall(Expr(EIdent("ISERROR"), span), [Arg(nil, tid)]), span)
+      return Ok(EBlock(Block([SLet(false, t, nil, v, span), SExpr(Expr(EIf(cond, blk(fb), blk(tid)), span))], span)))
+    }
+    Err(Diag("unknown lazy function $name", span))
+  }
+}
+
+/// Rebuild `e` with `f` applied to each direct child expression (blocks and statements included).
+fun mapChildren(e: Expr, f: (Expr) -> Expr): Expr {
+  val mb = |b: Block| Block(b.stmts.map(|s| mapStmt(s, f)), b.span)
+  val ma = |args: Vec<Arg>| args.map(|a| Arg(a.name, f(a.value)))
+  val k = match e.kind {
+    EStr(segs) => EStr(segs.map(|s| match s { SegExpr(x) => SegExpr(f(x)), _ => s }))
+    EOld(x, slot) => EOld(f(x), slot)
+    EUnary(op, x) => EUnary(op, f(x))
+    EPercent(x) => EPercent(f(x))
+    ETry(x) => ETry(f(x))
+    ENotNull(x) => ENotNull(f(x))
+    EIs(x, ty) => EIs(f(x), ty)
+    EQuantity(x, u) => EQuantity(f(x), u)
+    EBinary(op, l, r) => EBinary(op, f(l), f(r))
+    EIndex(l, r) => EIndex(f(l), f(r))
+    ERange(l, r) => ERange(f(l), f(r))
+    EThread(op, l, r) => EThread(op, f(l), f(r))
+    ECall(c, args) => ECall(f(c), ma(args))
+    EMember(obj, n, safe) => EMember(f(obj), n, safe)
+    ESuper(q, n, args) => ESuper(q, n, ma(args))
+    ELambda(ps, b) => ELambda(ps, f(b))
+    EIf(c, t, el) => EIf(f(c), mb(t), if el == nil { nil } else { mb(el!!) })
+    EMatch(s, arms) => EMatch(f(s), arms.map(|a| MatchArm(a.pat, if a.guard == nil { nil } else { f(a.guard!!) }, f(a.body), a.span)))
+    EVec(items) => EVec(items.map(f))
+    EMap(es) => EMap(es.map(|en| match en { MSpread(x) => MSpread(f(x)), MKv(kk, v) => MKv(f(kk), f(v)) }))
+    EBlock(b) => EBlock(mb(b))
+    ESheet(cells) => ESheet(cells.map(|c| SheetCell(c.cell, f(c.value), c.span)))
+    _ => e.kind
+  }
+  Expr(k, e.span)
+}
+
+fun mapStmt(s: Stmt, f: (Expr) -> Expr): Stmt = match s {
+  SLet(m, n, ty, init, sp) => SLet(m, n, ty, f(init), sp)
+  SAssign(t, op, v, sp) => SAssign(f(t), op, f(v), sp)
+  SExpr(e) => SExpr(f(e))
+  SReturn(v, sp) => if v == nil { s } else { SReturn(f(v!!), sp) }
+  SWhile(c, b) => SWhile(f(c), Block(b.stmts.map(|x| mapStmt(x, f)), b.span))
+  SFor(n, it, b) => SFor(n, f(it), Block(b.stmts.map(|x| mapStmt(x, f)), b.span))
+  _ => s
+}
+
+fun desugarProgram(decls: Vec<Decl>): Result<Vec<Decl>, Diag> {
+  var globals: Map<String, Bool> = {}
+  for d in decls {
+    match d {
+      DFun(f) => { globals = globals.assoc(f.name, true) }
+      DClass(c) => { globals = globals.assoc(c.name, true) }
+      DGeneric(g) => { globals = globals.assoc(g.name, true) }
+      DEnum(e) => { for v in e.variants { globals = globals.assoc(v.name, true) } }
+      _ => {}
+    }
+  }
+  Desugar(globals).program(decls)
+}

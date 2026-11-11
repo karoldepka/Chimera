@@ -1,0 +1,202 @@
+// ============================================================================
+// chimera — the Chimera compiler, written in Chimera.
+//
+// Stage 0 (the Rust compiler in src/) compiles this into stage 1; stage 1 compiles
+// itself into stage 2; tests/bootstrap.sh checks that all of them emit identical Rust.
+//
+//   chimera check  <file.chim>
+//   chimera emit   <file.chim>              print the generated Rust
+//   chimera build  <file.chim> [-o <dir>]   write + cargo-build a Rust crate
+//   chimera run    <file.chim> [-o <dir>]   build and run
+//   chimera tokens <file.chim>              dump the token stream
+// ============================================================================
+
+import "ast.chim"
+import "lexer.chim"
+import "parser.chim"
+import "desugar.chim"
+import "sema.chim"
+import "common.chim"
+import "native.chim"
+import "gen_rust.chim"
+
+fun runtimeSource(): String = embedFile("../runtime/rt.rs")
+
+// ---------------------------------------------------------------- source loading
+data class Segment(val start: Int, val end: Int, val file: String, val text: String)
+
+fun dirname(path: String): String {
+  val cs = path.chars()
+  var k = cs.count() - 1
+  while k >= 0 && cs[k] != "/" { k -= 1 }
+  if k < 0 { "." } else if k == 0 { "/" } else { path.substring(0, k) }
+}
+
+class Loader {
+  var seen: Vec<String> = []
+  var out: Vec<String> = []      // characters of the combined program
+  var segs: Vec<Segment> = []
+
+  /// `import "x.chim"` lines are resolved relative to the importing file (each file once); imported
+  /// files come first and the import line is blanked, so offsets inside every file are preserved.
+  fun load(path: String): Result<Bool, String> {
+    if seen.contains(path) { return Ok(true) }
+    seen = seen.push(path)
+    val text = match readFile(path) {
+      Ok(t) => t
+      Err(e) => { return Err("cannot read $path: $e") }
+    }
+    var body: Vec<String> = []
+    for line in text.split("\n") {
+      val t = line.trim()
+      if t.startsWith("import \"") && t.endsWith("\"") && t.length > 9 {
+        val rel = t.substring(8, t.length - 1)
+        load("${dirname(path)}/$rel")?
+        body = body.push(" ".repeat(line.length))
+      } else { body = body.push(line) }
+    }
+    val joined = body.join("\n")
+    val start = out.count()
+    for c in joined.chars() { out = out.push(c) }
+    out = out.push("\n")
+    segs = segs.push(Segment(start, out.count(), path, joined))
+    Ok(true)
+  }
+}
+
+// ---------------------------------------------------------------- diagnostics
+fun lineCol(text: Vec<String>, pos: Int): Vec<Int> {
+  var line = 1
+  var col = 1
+  var k = 0
+  while k < pos && k < text.count() {
+    if text[k] == "\n" { line += 1; col = 1 } else { col += 1 }
+    k += 1
+  }
+  [line, col]
+}
+
+fun render(d: Diag, segs: Vec<Segment>): String {
+  var seg = segs.last()!!
+  for s in segs { if d.span.start >= s.start && d.span.start < s.end { seg = s } }
+  val local = d.span.start - seg.start
+  val localEnd = if d.span.end > seg.start { d.span.end - seg.start } else { 0 }
+  val lc = lineCol(seg.text.chars(), local)
+  val line = lc[0]!!
+  val col = lc[1]!!
+  val text = seg.text.split("\n")[line - 1] ?: ""
+  var width = localEnd - local
+  if width < 1 { width = 1 }
+  var room = text.length - (col - 1)
+  if room < 1 { room = 1 }
+  if width > room { width = room }
+  val num = "$line"
+  "${seg.file}:$line:$col: error: ${d.msg}\n ${" ".repeat(4 - num.length)}$num | $text\n      | ${" ".repeat(col - 1)}${"^".repeat(width)}\n"
+}
+
+fun failWith(ds: Vec<Diag>, segs: Vec<Segment>) {
+  var out: Vec<String> = []
+  for d in ds { out = out.push(render(d, segs)) }
+  print(out.join(""))
+  eprintln("${ds.count()} error${if ds.count() == 1 { "" } else { "s" }} found")
+  exit(1)
+}
+
+// ---------------------------------------------------------------- pipeline
+data class Compiled(val decls: Vec<Decl>, val info: Info, val baseDir: String)
+
+fun compile(file: String): Compiled {
+  val loader = Loader()
+  match loader.load(file) {
+    Err(e) => { eprintln("error: $e"); exit(1) }
+    _ => {}
+  }
+  val src = loader.out
+  val parsed = match parseProgram(src) {
+    Ok(ds) => ds
+    Err(d) => { failWith([d], loader.segs); [] }
+  }
+  val desugared = match desugarProgram(parsed) {
+    Ok(ds) => ds
+    Err(d) => { failWith([d], loader.segs); [] }
+  }
+  val info = match check(desugared) {
+    Ok(i) => i
+    Err(ds) => { failWith(ds, loader.segs); Info() }
+  }
+  Compiled(desugared, info, dirname(file))
+}
+
+fun crateName(stem: String): String {
+  var out = ""
+  for c in stem.lower().chars() { out = out & (if isIdentChar(c) && c != "_" || isDigit(c) { c } else { "_" }) }
+  if isDigit(out.substring(0, 1)) { "p_$out" } else { out }
+}
+
+fun stemOf(path: String): String {
+  val base = path.split("/").last() ?: path
+  if base.endsWith(".chim") { base.substring(0, base.length - 5) } else { base }
+}
+
+fun writeOrDie(path: String, text: String) {
+  match writeFile(path, text) {
+    Err(e) => { eprintln("error: cannot write $path: $e"); exit(1) }
+    _ => {}
+  }
+}
+
+/// Writes `<dir>/{Cargo.toml, src/main.rs, src/rt.rs}`, formats it with rustfmt and builds it.
+fun buildRust(c: Compiled, out: String, stem: String): String {
+  val name = crateName(stem)
+  mkdirs("$out/src")
+  writeOrDie("$out/Cargo.toml", "# generated by chimera\n[package]\nname = \"$name\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n\n[profile.release]\noverflow-checks = true\n\n[workspace]\n")
+  writeOrDie("$out/src/main.rs", generateRust(c.decls, c.info, c.baseDir))
+  writeOrDie("$out/src/rt.rs", runtimeSource())
+  exec("rustfmt", ["--edition", "2021", "$out/src/main.rs"])
+  val code = exec("cargo", ["build", "--release", "-q", "--manifest-path", "$out/Cargo.toml"])
+  if code != 0 { eprintln("error: cargo failed on the generated crate in $out"); exit(1) }
+  "$out/target/release/$name"
+}
+
+fun usage() {
+  eprintln("Chimera compiler (self-hosted)\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> [-o <dir>]\n  chimera run   <file.chim> [-o <dir>] [-- args...]\n  chimera emit  <file.chim>\n  chimera tokens <file.chim>")
+  exit(2)
+}
+
+fun main() {
+  val argv = args()
+  if argv.count() < 2 { usage() }
+  val cmd = argv[0]!!
+  val file = argv[1]!!
+  var out: String? = nil
+  var rest: Vec<String> = []
+  var k = 2
+  while k < argv.count() {
+    val a = argv[k]!!
+    if a == "-o" { out = argv[k + 1]; k += 2 }
+    else if a == "--target" || a == "-t" {
+      if argv[k + 1] != "rust" { eprintln("error: the self-hosted compiler only has the Rust backend"); exit(2) }
+      k += 2
+    }
+    else if a == "--" { rest = argv.drop(k + 1); k = argv.count() }
+    else { usage() }
+  }
+  if cmd == "tokens" {
+    val text = match readFile(file) { Ok(t) => t, Err(e) => { eprintln("error: $e"); exit(1); "" } }
+    match dumpTokens(text) {
+      Ok(s) => print(s)
+      Err(d) => failWith([d], [Segment(0, text.length + 1, file, text)])
+    }
+    return nil
+  }
+  val c = compile(file)
+  if cmd == "check" { println("$file: ok"); return nil }
+  if cmd == "emit" { print(generateRust(c.decls, c.info, c.baseDir)); return nil }
+  if cmd == "build" || cmd == "run" {
+    val stem = stemOf(file)
+    val bin = buildRust(c, out ?: "${stem}_rs", stem)
+    if cmd == "build" { eprintln("wrote $bin"); return nil }
+    exit(exec(bin, rest))
+  }
+  usage()
+}

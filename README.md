@@ -38,6 +38,7 @@ fun main() {
 | **Clojure** | persistent immutable vectors and maps, records as maps (`{...user, name: "x"}`), threading macros `->` / `->>`, atoms (`atom`, `swap`, `@a`) |
 | **TypeScript** | structural record types, literal and union types, `Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Record`, `NonNullable`, `Exclude`, `Extract`, `ReturnType`, `keyof`, excess-property checks |
 | **Google Sheets** | `sheet { }` blocks with cells, ranges (`B1:B3`) and reactive formulas; 50+ functions (`SUM`, `IF`, `IFS`, `VLOOKUP`, `SUMIF`, `TEXTJOIN`, `LET`, `LAMBDA`, `MAP`, `REDUCE`…); `&` concatenation, `<>`, `^`, `15%`, `{1, 2; 3, 4}` array literals |
+| *new* | **ordinals as an affine unit**: `1st`, `2nd`, `3rd` are positions and plain numbers are counts. `3rd + 2 == 5th`, `10th - 3rd == 7`, and `1st + 3rd` is a compile error |
 | *new* | **exact decimals by default** (`1.0999` is a `Decimal`; `1.5f` is a `Float`) and **units of measure** (`100 USD`, `2.5 kW`) with conversion (`1 kW + 500 W`) and compile-time unit checks |
 | **Traits** | `trait`s with abstract and default methods, mixed freely with classes |
 
@@ -64,6 +65,9 @@ You need Rust (cargo, rustc; rustfmt is optional) and, for the JS target, Node 1
 | `examples/data.chim` | records and utility types, null safety, `Result` and `?`, persistent collections, atoms |
 | `examples/sheets.chim` | reactive sheets, Sheets formulas, exact decimals, units of measure |
 | `examples/native.chim` | functions lowered to native Rust (`i64`/`f64`/`bool`) |
+| `examples/ordinals.chim` | ordinal vs cardinal numbers |
+| `examples/tour.chim` | everything together: a small energy-billing system |
+| `selfhost/*.chim` | the Chimera compiler, in Chimera |
 | `tests/errors/*.chim` | what the checker rejects: unit mismatches, null safety, excess properties, missing overrides, diamond conflicts, non-exhaustive matches… |
 
 ## Rust backend
@@ -81,18 +85,34 @@ You need Rust (cargo, rustc; rustfmt is optional) and, for the JS target, Node 1
 * **Everything else** goes through `rt::Value`, a uniform value type (`Rc` based; persistent collections are copy-on-write through `Rc::make_mut`, so `xs = xs.push(v)` is amortised O(1) when `xs` is not shared).
 * Classes, MROs, invariants and multimethods are registered in a small runtime table at startup.
 
-## Self-hosting
+## Self-hosting ✅
 
-The first milestone is a self-hosted compiler, built in stages. See [SELFHOSTING.md](SELFHOSTING.md).
+The compiler compiles itself. `selfhost/` contains the full compiler written in Chimera (about 3,400 lines): lexer, parser, desugaring, semantic analysis, native lowering, the Rust backend, and a driver that writes and builds Cargo crates.
 
-* ✅ **Stage 1: lexer.** `selfhost/lexer.chim` is the Chimera lexer written in Chimera. Compiled with the Rust backend, it produces exactly the same token stream as the Rust lexer on every `.chim` file in the repo, its own source included (`tests/selfhost.sh`).
-* ⏭ Stage 2: parser, then checker, then the Rust backend, then the compiler compiles itself.
+```
+stage 0  src/*.rs (Rust)        ──compiles──▶  stage 1  (selfhost/*.chim → Rust → native binary)
+stage 1                         ──compiles──▶  stage 2
+stage 2 emits exactly what stage 1 emits  ⇒  fixpoint ✓
+```
+
+`tests/bootstrap.sh` verifies all of this (46 checks):
+* the fixpoint: stage 0, stage 1 and stage 2 emit the same 458 KB of Rust for the compiler itself;
+* every example: all stages emit byte-identical Rust, and the stage-2 binary runs it with the golden output;
+* the self-hosted lexer produces the same token stream as stage 0 on every `.chim` file;
+* the ported checks give exactly the same diagnostics as stage 0: C3/override/abstract/diamond rules, name resolution, arity, `val`/capture rules, contract scoping, exhaustiveness.
+
+Stage 1 compiles its own source in about 0.7 s. Not ported yet: the gradual *type* checks (records and utility types, units, null safety, ordinal arithmetic) and the JS backend. Those remain stage-0 features, and porting them is the next milestone (see [SELFHOSTING.md](SELFHOSTING.md)).
+
+```bash
+./target/release/chimera build selfhost/main.chim -o build/stage1     # stage 0 → stage 1
+build/stage1/target/release/main run examples/tour.chim               # use the self-hosted compiler
+```
 
 ## Tests
 
 ```bash
 tests/run.sh        # every example on both backends vs. golden output, plus expected diagnostics
-tests/selfhost.sh   # self-hosted lexer must match the Rust lexer token-for-token
+tests/bootstrap.sh  # self-hosting: stage0 → stage1 → stage2 fixpoint, identical output everywhere
 ```
 
 ## Layout
@@ -102,7 +122,7 @@ src/lexer.rs  parser.rs  desugar.rs  sema.rs  units.rs   front end
 src/gen_rust.rs  native.rs  gen_js.rs  common.rs         back ends
 src/main.rs                                              CLI
 runtime/rt.rs  runtime/rt.js                             runtimes (kept semantically identical)
-selfhost/                                                the compiler, written in Chimera
+selfhost/main.chim  ast  lexer  parser  desugar  sema  common  native  gen_rust   the compiler, in Chimera
 SPEC.md                                                  language reference
 ```
 

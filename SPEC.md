@@ -96,14 +96,21 @@ println(s.B4)  s["B4"]  s.get("B4")  s.cells()
 * Sheets errors are `Err("#N/A")`, `Err("#DIV/0!")`, and so on; `IFERROR` and `ISERROR` handle them.
 * All of these functions work anywhere, not only inside sheets.
 
-## 6. Builtins
+## 6. Modules, ordinals, smart casts
 
-`println print eprintln str atom range panic assert readFile writeFile args exit Ok Err`, plus methods on strings, numbers, vectors, maps, atoms, `Result` and sheets (see `runtime/rt.rs`, `builtin_method`).
+* `import "other.chim"` at the top level includes another file once, with its path relative to the importing file. Diagnostics report the original file and line.
+* `embedFile("path")` inlines a file's contents as a string at compile time. The path is relative to the main source file.
+* **Ordinals:** `1st`, `2nd`, `3rd`, `4th` (no space; the suffix must be correct, so `21th` is an error) or `n ord` have the unit `ord`. Position ± `Int` = position; position − position = `Int`. Position + position, `*`, `/` and non-integer offsets are errors at compile time and at run time. Use `p.index` (zero-based), `p.cardinal`, and `n.ordinal()`.
+* **Smart casts** (Kotlin): `x` is non-null inside `if x != nil { … }`, on the right of `x != nil && …` and `x == nil || …`, and after `if x == nil { return / break / continue }`.
 
-## 7. Known limitations (v0.1)
+## 7. Builtins
+
+`println print eprintln str atom range panic assert readFile writeFile args exit exec mkdirs embedFile Ok Err`, plus methods on strings, numbers, vectors, maps, atoms, `Result` and sheets (see `runtime/rt.rs`, `builtin_method`).
+
+## 8. Known limitations (v0.1)
 
 * The checker is gradual: unannotated values are `Any`. Generic type parameters are accepted but not checked.
 * Named arguments are checked and reordered only for functions, constructors and `copy`; calls to methods are positional.
 * Rust backend: only native-lowerable functions avoid `rt::Value`. Classes are dynamic objects, not Rust structs.
 * JS backend: `Int` is a BigInt (with i64 overflow checks), so it is slower than JS numbers.
-* No modules or imports yet. These are needed for self-hosting stage 2+.
+* `import` is textual inclusion; there are no namespaces.

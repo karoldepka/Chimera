@@ -14,6 +14,7 @@ const RUST_KW: &[&str] = &[
 ];
 
 pub fn rid(n: &str) -> String {
+    if n == "_" { return "__unused".into(); }
     if matches!(n, "self" | "Self" | "super" | "crate") { return format!("{}_", n); }
     if RUST_KW.contains(&n) { format!("r#{}", n) } else { n.to_string() }
 }
@@ -154,8 +155,8 @@ impl<'a> Gen<'a> {
             for i in &c.invariants {
                 b.push_str(&format!("    if !rt::truthy({}) {{\n        return Some({});\n    }}\n", self.rf(&i.expr), lit(&i.tag.as_ref().map(|t| format!("{}: {}", t, i.text)).unwrap_or(i.text.clone()))));
             }
-            out.push_str(&format!("fn {}__inv(this: &Value) -> Option<&'static str> {{\n    let this = this.clone();\n{}    None\n}}\n\n", c.name, b));
-            format!("Some({}__inv)", c.name)
+            out.push_str(&format!("fn inv_{}(this: &Value) -> Option<&'static str> {{\n    let this = this.clone();\n{}    None\n}}\n\n", c.name, b));
+            format!("Some(inv_{})", c.name)
         };
         // constructor
         if !c.is_trait {
@@ -171,15 +172,15 @@ impl<'a> Gen<'a> {
                     Some(e) => self.expr(e),
                     None => p.default.as_ref().map(|d| self.expr(d)).unwrap_or("Value::Nil".into()),
                 }).collect();
-                b.push_str(&format!("    {}__init(&this{}{});\n", s.name, if vals.is_empty() { "" } else { ", " }, vals.join(", ")));
+                b.push_str(&format!("    init_{}(&this{}{});\n", s.name, if vals.is_empty() { "" } else { ", " }, vals.join(", ")));
             }
             for p in &c.params { if p.field.is_some() { b.push_str(&format!("    rt::set(&this, {}, {}.clone());\n", lit(&p.name), rid(&p.name))); } }
             for f in &c.fields { b.push_str(&format!("    rt::set(&this, {}, {});\n", lit(&f.name), self.expr(&f.init))); }
             let ps = self.params_list(&c.params);
-            out.push_str(&format!("fn {}__init(this: &Value{}{}) {{\n{}}}\n", c.name, if ps.is_empty() { "" } else { ", " }, ps, b));
+            out.push_str(&format!("fn init_{}(this: &Value{}{}) {{\n{}}}\n", c.name, if ps.is_empty() { "" } else { ", " }, ps, b));
             let names: Vec<String> = c.params.iter().map(|p| rid(&p.name)).collect();
             let plain: Vec<String> = c.params.iter().map(|p| format!("{}: Value", rid(&p.name))).collect();
-            out.push_str(&format!("fn {}__new({}) -> Value {{\n    let this = rt::new_obj({});\n    {}__init(&this{}{});\n    rt::finish_new(this)\n}}\n\n",
+            out.push_str(&format!("fn new_{}({}) -> Value {{\n    let this = rt::new_obj({});\n    init_{}(&this{}{});\n    rt::finish_new(this)\n}}\n\n",
                 c.name, plain.join(", "), lit(&c.name), c.name, if names.is_empty() { "" } else { ", " }, names.join(", ")));
         }
         let mro: Vec<String> = ci.mro.iter().map(|m| lit(m)).collect();
@@ -219,8 +220,8 @@ impl<'a> Gen<'a> {
                 if let (ExprKind::Ident(n), ExprKind::Call(c, args)) = (&target.kind, &value.kind) {
                     if let ExprKind::Member { obj, name, safe: false } = &c.kind {
                         if matches!(&obj.kind, ExprKind::Ident(o) if o == n) && self.is_local(n) && args.iter().all(|a| a.name.is_none()) {
-                            if (name == "push" || name == "conj") && args.len() == 1 { let x = self.expr(&args[0].value); return format!("rt::push_mut(&mut {}, {});", rid(n), x); }
-                            if name == "assoc" && args.len() == 2 { let k = self.expr(&args[0].value); let x = self.expr(&args[1].value); return format!("rt::assoc_mut(&mut {}, {}, {});", rid(n), k, x); }
+                            if (name == "push" || name == "conj") && args.len() == 1 { let x = self.expr(&args[0].value); return format!("{{ let __v = {}; rt::push_mut(&mut {}, __v); }}", x, rid(n)); }
+                            if name == "assoc" && args.len() == 2 { let k = self.expr(&args[0].value); let x = self.expr(&args[1].value); return format!("{{ let __k = {}; let __v = {}; rt::assoc_mut(&mut {}, __k, __v); }}", k, x, rid(n)); }
                         }
                     }
                 }
@@ -233,7 +234,7 @@ impl<'a> Gen<'a> {
                 }
                 if let (ExprKind::Ident(n), ExprKind::Binary(op, l, r)) = (&target.kind, &value.kind) {
                     if (op == "&" || (op == "+" && matches!(r.kind, ExprKind::Str(_)))) && matches!(&l.kind, ExprKind::Ident(o) if o == n) && self.is_local(n) {
-                        let x = self.rf(r); return format!("rt::str_append(&mut {}, {});", rid(n), x);
+                        let x = self.expr(r); return format!("{{ let __v = {}; rt::str_append(&mut {}, &__v); }}", x, rid(n));
                     }
                 }
                 let v = self.expr(value);
@@ -334,7 +335,7 @@ impl<'a> Gen<'a> {
         }
         if let Some(c) = self.d.classes.get(n) {
             let args: Vec<String> = (0..c.params.len()).map(|i| format!("a.get({}).cloned().unwrap_or(Value::Nil)", i)).collect();
-            return Some(format!("rt::func(|a: Vec<Value>| {}__new({}))", n, args.join(", ")));
+            return Some(format!("rt::func(|a: Vec<Value>| new_{}({}))", n, args.join(", ")));
         }
         if self.info.generics.contains_key(n) { return Some(format!("rt::func(|a: Vec<Value>| rt::call_generic({}, a))", lit(n))); }
         None
@@ -364,7 +365,7 @@ impl<'a> Gen<'a> {
                 }
                 if self.method(n) { return format!("rt::call_self(&this, {}, {})", lit(n), self.args_vec(args)); }
                 if let Some(f) = self.d.funs.get(n).copied() { let v = self.ordered(&f.params, args); return format!("{}({})", fname(n), v.join(", ")); }
-                if let Some(c) = self.d.classes.get(n).copied() { let v = self.ordered(&c.params, args); return format!("{}__new({})", n, v.join(", ")); }
+                if let Some(c) = self.d.classes.get(n).copied() { let v = self.ordered(&c.params, args); return format!("new_{}({})", n, v.join(", ")); }
                 if self.info.variant_of.contains_key(n) { return self.variant_call(n, args); }
                 if self.info.generics.contains_key(n) { return format!("rt::call_generic({}, {})", lit(n), self.args_vec(args)); }
                 if is_builtin(n) {

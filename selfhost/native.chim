@@ -1,0 +1,324 @@
+// Native lowering for the Rust backend (self-hosted). Port of src/native.rs.
+// Native types are the strings "i64", "f64", "bool".
+
+fun ntyFromNode(t: TypeNode?): String? = match t {
+  TName(n, targs, _) => if !targs.isEmpty() { nil } else if n == "Int" { "i64" } else if n == "Float" { "f64" } else if n == "Bool" { "bool" } else { nil }
+  _ => nil
+}
+fun ntyUnbox(t: String, v: String): String =
+  if t == "i64" { "rt::as_int(&$v)" } else if t == "f64" { "rt::as_f64(&$v)" } else { "rt::truthy(&$v)" }
+fun ntyBox(t: String, v: String): String =
+  if t == "i64" { "Value::Int($v)" } else if t == "f64" { "Value::Float($v)" } else { "Value::Bool($v)" }
+
+data class NSig(val params: Vec<String>, val ret: String)
+
+/// Functions that can be lowered natively (fixpoint over the call graph).
+fun analyzeNative(decls: Vec<Decl>): Map<String, NSig> {
+  var cand: Map<String, NSig> = {}
+  var funs: Map<String, FunDecl> = {}
+  for d in decls {
+    match d {
+      DFun(f) => {
+        val ps = f.params.map(|p| ntyFromNode(p.ty))
+        val r = ntyFromNode(f.ret)
+        if !ps.contains(nil) && r != nil && f.body != nil {
+          cand = cand.assoc(f.name, NSig(ps, r!!))
+          funs = funs.assoc(f.name, f)
+        }
+      }
+      _ => {}
+    }
+  }
+  while true {
+    var bad: Vec<String> = []
+    for name in cand.keys() {
+      if !NChecker(cand).funOk(funs[name]!!, cand[name]!!) { bad = bad.push(name) }
+    }
+    if bad.isEmpty() { return cand }
+    for b in bad { cand = cand.dissoc(b) }
+  }
+  cand
+}
+
+class NChecker(val sigs: Map<String, NSig>) {
+  var scopes: Vec<Map<String, String>> = [{}]
+  var ret: String? = nil
+
+  fun lookup(n: String): String? {
+    var k = scopes.count() - 1
+    while k >= 0 { val t = scopes[k]!![n]; if t != nil { return t }; k -= 1 }
+    nil
+  }
+  fun push(m: Map<String, String>) { scopes = scopes.push(m) }
+  fun pop() { scopes = scopes.take(scopes.count() - 1) }
+  fun declare(n: String, t: String) { scopes = scopes.assoc(scopes.count() - 1, scopes.last()!!.assoc(n, t)) }
+
+  fun funOk(f: FunDecl, sig: NSig): Bool {
+    for k in 0..f.params.count() {
+      val p = f.params[k]!!
+      val t = sig.params[k]!!
+      if p.dflt != nil && ty(p.dflt!!) != t { return false }
+      declare(p.name, t)
+    }
+    ret = sig.ret
+    if f.requires.any(|c| ty(c.expr) != "bool") { return false }
+    if f.olds.any(|o| ty(o) == nil) { return false }
+    if !valueOf(f.body!!, sig.ret) { return false }
+    push({result: sig.ret})
+    val ok = f.ensures.all(|c| ty(c.expr) == "bool")
+    pop()
+    ok
+  }
+
+  fun valueOf(e: Expr, want: String): Bool = match e.kind {
+    EBlock(b) => {
+      push({})
+      val n = b.stmts.count()
+      var ok = true
+      for k in 0..n {
+        val s = b.stmts[k]!!
+        if k + 1 == n {
+          val last = match s {
+            SExpr(x) => valueOf(x, want)
+            SReturn(v, _) => v != nil && ty(v!!) == ret
+            _ => false
+          }
+          ok = ok && last
+        } else { ok = ok && stmt(s) }
+      }
+      pop()
+      ok && n > 0
+    }
+    EIf(c, t, el) => {
+      if el == nil { ty(e) == want } else {
+        ty(c) == "bool" && valueOf(Expr(EBlock(t), e.span), want) && valueOf(Expr(EBlock(el!!), e.span), want)
+      }
+    }
+    _ => ty(e) == want
+  }
+
+  fun stmt(s: Stmt): Bool = match s {
+    SLet(_, n, tyNode, init, _) => {
+      val t = ty(init)
+      if t == nil { false } else if tyNode != nil && ntyFromNode(tyNode) != t { false } else { declare(n, t!!); true }
+    }
+    SAssign(target, _, value, _) => match target.kind {
+      EIdent(n) => lookup(n) != nil && ty(value) == lookup(n)
+      _ => false
+    }
+    SExpr(e) => match e.kind {
+      EIf(c, t, el) => ty(c) == "bool" && stmts(t.stmts) && (el == nil || stmts(el!!.stmts))
+      EBlock(b) => stmts(b.stmts)
+      _ => ty(e) != nil
+    }
+    SReturn(v, _) => v != nil && ty(v!!) == ret
+    SWhile(c, b) => ty(c) == "bool" && stmts(b.stmts)
+    SFor(n, it, b) => match it.kind {
+      ERange(a, z) => {
+        if ty(a) != "i64" || ty(z) != "i64" { false } else {
+          push({})
+          declare(n, "i64")
+          val ok = stmts(b.stmts)
+          pop()
+          ok
+        }
+      }
+      _ => false
+    }
+    SBreak(_) => true
+    SContinue(_) => true
+  }
+
+  fun stmts(ss: Vec<Stmt>): Bool {
+    push({})
+    var ok = true
+    for s in ss { if ok { ok = stmt(s) } }
+    pop()
+    ok
+  }
+
+  fun ty(e: Expr): String? = match e.kind {
+    EInt(_) => "i64"
+    EFloat(_) => "f64"
+    EBool(_) => "bool"
+    EIdent(n) => lookup(n)
+    EResult => lookup("result")
+    EOld(x, _) => ty(x)
+    EUnary(op, x) => {
+      val t = ty(x)
+      if t == nil { nil } else if op == "-" && t != "bool" { t } else if op == "!" && t == "bool" { t } else { nil }
+    }
+    EBinary(op, l, r) => {
+      val a = ty(l)
+      val b = ty(r)
+      if a == nil || b == nil || a != b { nil }
+      else if ["+", "-", "*", "/", "%"].contains(op) && a != "bool" { a }
+      else if ["<", "<=", ">", ">="].contains(op) && a != "bool" { "bool" }
+      else if op == "==" || op == "!=" { "bool" }
+      else if (op == "&&" || op == "||") && a == "bool" { "bool" }
+      else { nil }
+    }
+    EIf(c, t, el) => {
+      if el == nil || ty(c) != "bool" { nil } else {
+        val probe = blockTy(Expr(EBlock(t), e.span))
+        if probe == nil { nil } else if valueOf(Expr(EBlock(el!!), e.span), probe!!) { probe } else { nil }
+      }
+    }
+    EBlock(_) => blockTy(e)
+    ECall(c, args) => match c.kind {
+      EIdent(n) => {
+        if lookup(n) != nil { nil } else {
+          val sig = sigs[n]
+          if sig == nil { nil }
+          else if args.any(|a| a.name != nil) || args.count() > sig.params.count() { nil }
+          else {
+            var ok = true
+            for k in 0..args.count() { if ok && ty(args[k]!!.value) != sig.params[k] { ok = false } }
+            if ok { sig.ret } else { nil }
+          }
+        }
+      }
+      _ => nil
+    }
+    _ => nil
+  }
+
+  fun blockTy(e: Expr): String? = match e.kind {
+    EBlock(b) => {
+      if b.stmts.isEmpty() { nil } else { ["i64", "f64", "bool"].find(|t| valueOf(e, t)) }
+    }
+    _ => ty(e)
+  }
+}
+
+class NGen(val sigs: Map<String, NSig>, val decls: Vec<Decl>) {
+  var scopes: Vec<Vec<String>> = []
+  var defaults: Map<String, Vec<Param>> = {}
+
+  fun init(): NGen {
+    for d in decls { match d { DFun(f) => { if sigs.containsKey(f.name) { defaults = defaults.assoc(f.name, f.params) } }, _ => {} } }
+    this
+  }
+
+  fun function(f: FunDecl, wrapper: String): String {
+    val sig = sigs[f.name]!!
+    scopes = [f.params.map(|p| p.name)]
+    var ps: Vec<String> = []
+    for k in 0..f.params.count() { ps = ps.push("mut ${rid(f.params[k]!!.name)}: ${sig.params[k]}") }
+    var b: Vec<String> = []
+    for r in f.requires {
+      b = b.push("    if !(${expr(r.expr)}) {\n        rt::fail(${lit(contractMsg("precondition", f.name, r))});\n    }\n")
+    }
+    val body = expr(f.body!!)
+    if f.ensures.isEmpty() {
+      b = b.push("    $body\n")
+    } else {
+      for k in 0..f.olds.count() { b = b.push("    let __old$k = ${expr(f.olds[k]!!)};\n") }
+      b = b.push("    let result: ${sig.ret} = (|| -> ${sig.ret} { $body })();\n")
+      scopes = scopes.assoc(0, scopes[0]!!.push("result"))
+      for e in f.ensures {
+        b = b.push("    if !(${expr(e.expr)}) {\n        rt::fail(${lit(contractMsg("postcondition", f.name, e))});\n    }\n")
+      }
+      b = b.push("    result\n")
+    }
+    val native = rid(f.name)
+    val wp = f.params.map(|p| "${rid(p.name)}: Value")
+    var wa: Vec<String> = []
+    for k in 0..f.params.count() { wa = wa.push(ntyUnbox(sig.params[k]!!, rid(f.params[k]!!.name))) }
+    val callBox = ntyBox(sig.ret, "$native(${wa.join(", ")})")
+    "/// native: `${f.name}` compiled to plain Rust (${sig.params.join(", ")} -> ${sig.ret})\nfn $native(${ps.join(", ")}) -> ${sig.ret} {\n${b.join("")}}\nfn $wrapper(${wp.join(", ")}) -> Value {\n    $callBox\n}\n\n"
+  }
+
+  fun block(b: Block): String {
+    scopes = scopes.push([])
+    var parts: Vec<String> = []
+    val n = b.stmts.count()
+    for k in 0..n {
+      val s = b.stmts[k]!!
+      val part = match s {
+        SExpr(e) if k + 1 == n => expr(e)
+        _ => stmt(s)
+      }
+      parts = parts.push(part)
+    }
+    scopes = scopes.take(scopes.count() - 1)
+    "{ ${parts.join(" ")} }"
+  }
+
+  fun stmt(s: Stmt): String = match s {
+    SLet(_, n, _, init, _) => {
+      val v = expr(init)
+      scopes = scopes.assoc(scopes.count() - 1, scopes.last()!!.push(n))
+      "let mut ${rid(n)} = $v;"
+    }
+    SAssign(target, _, value, _) => match target.kind {
+      EIdent(n) => "${rid(n)} = ${expr(value)};"
+      _ => ""
+    }
+    SExpr(e) => match e.kind {
+      EIf(c, t, el) => {
+        val th = unitBlock(t)
+        val els = if el == nil { "" } else { " else ${unitBlock(el!!)}" }
+        "if ${expr(c)} $th$els"
+      }
+      _ => "${expr(e)};"
+    }
+    SReturn(v, _) => "return ${expr(v!!)};"
+    SWhile(c, b) => { val cs = expr(c); "while $cs ${unitBlock(b)}" }
+    SFor(n, it, b) => match it.kind {
+      ERange(a, z) => {
+        val av = expr(a)
+        val zv = expr(z)
+        scopes = scopes.push([n])
+        val body = unitBlock(b)
+        scopes = scopes.take(scopes.count() - 1)
+        "for ${rid(n)} in $av..$zv $body"
+      }
+      _ => ""
+    }
+    SBreak(_) => "break;"
+    SContinue(_) => "continue;"
+  }
+
+  fun unitBlock(b: Block): String {
+    scopes = scopes.push([])
+    var parts: Vec<String> = []
+    for s in b.stmts {
+      val x = stmt(s)
+      parts = parts.push(if x.endsWith(";") || x.endsWith("}") { x } else { "$x;" })
+    }
+    scopes = scopes.take(scopes.count() - 1)
+    "{ ${parts.join(" ")} }"
+  }
+
+  fun operand(e: Expr): String {
+    val s = expr(e)
+    val wrap = match e.kind { EBinary(_, _, _) => true, EUnary(_, _) => true, EIf(_, _, _) => true, _ => false }
+    if wrap { "($s)" } else { s }
+  }
+
+  fun expr(e: Expr): String = match e.kind {
+    EInt(i) => if i < 0 { "(${i}i64)" } else { "${i}i64" }
+    EFloat(f) => "${floatLit(f)}f64"
+    EBool(b) => str(b)
+    EIdent(n) => rid(n)
+    EResult => "result"
+    EOld(_, slot) => "__old$slot"
+    EUnary(op, x) => "$op${operand(x)}"
+    EBinary(op, l, r) => { val a = operand(l); "$a $op ${operand(r)}" }
+    EIf(c, t, el) => { val cs = expr(c); val ts = block(t); "if $cs $ts else ${block(el!!)}" }
+    EBlock(b) => block(b)
+    ECall(c, args) => {
+      val n = match c.kind { EIdent(x) => x, _ => "" }
+      val params = defaults[n]!!
+      val ord = orderArgs(params, args)
+      var vals: Vec<String> = []
+      for k in 0..params.count() {
+        val given = ord[k]
+        vals = vals.push(if given != nil { expr(given) } else { expr(params[k]!!.dflt!!) })
+      }
+      "${rid(n)}(${vals.join(", ")})"
+    }
+    _ => "/* unreachable */"
+  }
+}

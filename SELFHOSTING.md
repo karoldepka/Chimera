@@ -1,27 +1,40 @@
-# Self-hosting plan
+# Self-hosting
 
-**Goal (milestone 1):** `chimera` is written in Chimera, compiled by the Rust-hosted compiler (stage 0) into a Rust binary (stage 1). Stage 1 then compiles its own sources into a stage-2 binary whose output is identical. That is the classic bootstrap fixpoint.
+**Milestone 1 is done ✅: the compiler is self-hosting.**
 
-The Rust compiler in `src/` is **stage 0**. It is the reference implementation, and every self-hosted component is tested against it on the whole corpus.
+```
+stage 0   src/*.rs            the reference compiler (Rust)
+stage 1   selfhost/*.chim     compiled by stage 0 to Rust, then by cargo to a native binary
+stage 2   selfhost/*.chim     compiled by stage 1
+fixpoint  stage1(compiler) == stage2(compiler), byte for byte
+```
 
-| Step | Component | Chimera source | Verified by | Status |
-|---|---|---|---|---|
-| 1 | Lexer | `selfhost/lexer.chim` | token dump == `chimera tokens` on every `.chim` file (`tests/selfhost.sh`) | ✅ done |
-| 2 | Parser + AST | `selfhost/parser.chim` | AST dump == `chimera ast` (a new stage-0 command) | next |
-| 3 | Desugaring | `selfhost/desugar.chim` | desugared AST dump | |
-| 4 | Checker | `selfhost/sema.chim` | diagnostics == `tests/expected/err_*.out` | |
-| 5 | Rust backend + native lowering | `selfhost/gen_rust.chim` | generated `main.rs` byte-identical to stage 0's | |
-| 6 | Driver | `selfhost/main.chim` | `tests/run.sh` passes with the stage-1 binary | |
-| 7 | Fixpoint | — | stage1(compiler) == stage2(compiler) | |
+Run `tests/bootstrap.sh` to rebuild every stage and verify (46 checks).
 
-## Language work the later stages need
+| Component | Chimera source | Verified by | Status |
+|---|---|---|---|
+| Lexer | `selfhost/lexer.chim` | same token stream as `chimera tokens` on every `.chim` file | ✅ |
+| Parser + AST | `selfhost/parser.chim`, `ast.chim` | identical generated Rust for every program | ✅ |
+| Desugaring | `selfhost/desugar.chim` | same (including temporary numbering) | ✅ |
+| Structural checks | `selfhost/sema.chim` | identical diagnostics: classes, contracts, ordinal syntax | ✅ |
+| Native lowering | `selfhost/native.chim` | identical native functions | ✅ |
+| Rust backend | `selfhost/gen_rust.chim` | byte-identical `main.rs` | ✅ |
+| Driver | `selfhost/main.chim` | imports, diagnostics, `check/emit/build/run/tokens` | ✅ |
+| Fixpoint | | stage 1 output == stage 2 output | ✅ |
 
-* **Modules:** `import lexer` across files, so the compiler isn't one giant file (needed by step 2).
-* **Enum methods and recursive enum types** for the AST (`enum Expr { Binary(op: String, l: Expr, r: Expr), … }`). Runtime support exists already; the checker needs recursive aliases.
-* **`StringBuilder`-style output:** `s = s & x` is already an in-place append in the Rust backend, and `xs = xs.push(x)` / `m = m.assoc(k, v)` / `this.f = this.f.push(x)` are amortised O(1) through `Rc::make_mut`.
-* **Native lowering for more types** (strings, vectors of natives, data classes → Rust `struct`s), so the self-hosted compiler runs at a speed comparable to stage 0.
-* **`chimera ast` and `chimera desugar`** dump commands in stage 0, to diff against.
+## What bootstrapping found
 
-## Why the lexer first
+Compiling the compiler with itself exposed real bugs in stage 0, which are now fixed in both stages:
+* a method named `init` collided with the generated constructor (constructors are now `new_C` / `init_C`);
+* a lambda parameter `_` generated invalid Rust;
+* the in-place `xs = xs.assoc(xs.count() - 1, v)` fast path violated the borrow checker;
+* the checker needed Kotlin's flow-sensitive smart casts (`x == nil || x.f`, `if x == nil { return }`) to accept idiomatic null-safe code.
 
-The lexer is the smallest component that exercises everything a compiler written in Chimera needs: file I/O (`readFile`, `args`, `exit`), string and char processing, classes with mutable state, persistent vectors with in-place fast paths, `Result` error handling, `match`, and string building. It also gives a byte-exact oracle to test against. The self-hosted lexer tokenizes its own source correctly, and that is part of the test.
+Language features added for self-hosting: `import "file.chim"`, compile-time `embedFile(...)` (the compiler embeds its runtime), and `exec` / `mkdirs` / `readFile` / `writeFile` / `args` / `exit`. The runtime also gained a 1 GiB main stack and copy-on-write fast paths.
+
+## Milestone 2: full parity
+
+* Port the gradual **type checker** (records and utility types, units of measure, null safety, ordinal arithmetic) into `selfhost/sema.chim`. Today these checks run only in stage 0, so stage 1 accepts some ill-typed programs that stage 0 rejects.
+* Port the **JavaScript backend** (`src/gen_js.rs`).
+* Then make stage 1 the default compiler and keep stage 0 only for bootstrapping.
+* Performance: lower data classes and enums to Rust `struct`s/`enum`s, so the self-hosted compiler stops going through `rt::Value`.

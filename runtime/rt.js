@@ -574,6 +574,7 @@ const $rt = (() => {
       const st = recv;
       switch (name) {
         case "length": case "count": return BigInt(Array.from(st).length);
+        case "code": return BigInt(st.length ? st.codePointAt(0) : 0);
         case "upper": case "uppercase": return st.toUpperCase();
         case "lower": case "lowercase": return st.toLowerCase();
         case "trim": return st.trim();

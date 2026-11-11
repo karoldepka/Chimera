@@ -1,0 +1,560 @@
+// Semantic analysis (self-hosted). Ports the structural part of src/sema.rs:
+// class collection with C3 linearization, override/abstract/diamond rules, enums,
+// generic functions, name resolution, arity, val/capture rules and match exhaustiveness.
+// (The gradual *type* checks — records, units, nullability — are stage-0 only for now.)
+
+fun builtins(): Vec<String> = [
+  "println", "print", "str", "atom", "range", "Ok", "Err", "panic", "assert",
+  "SUM", "AVERAGE", "MIN", "MAX", "COUNT", "COUNTA", "PRODUCT", "MEDIAN", "ROUND", "ROUNDUP", "ROUNDDOWN", "ABS",
+  "SQRT", "POWER", "MOD", "INT", "LEN", "UPPER", "LOWER", "TRIM", "LEFT", "RIGHT", "MID", "CONCATENATE", "TEXTJOIN",
+  "SPLIT", "SUBSTITUTE", "SUMIF", "COUNTIF", "AVERAGEIF", "FILTER", "SORT", "UNIQUE", "SEQUENCE", "VLOOKUP", "INDEX",
+  "MATCH", "ISBLANK", "ISNUMBER", "ISTEXT", "ISERROR", "MAP", "REDUCE", "TRUE", "FALSE", "UNIT", "CONVERT",
+  "readFile", "writeFile", "args", "exit", "eprintln", "exec", "mkdirs", "embedFile"
+]
+fun isBuiltin(n: String): Bool = builtins().contains(n)
+
+data class FieldInfo(val name: String, val mutable: Bool, val owner: String)
+// params: Vec of [name, hasDefault]
+data class MethodSig(val owner: String, val params: Vec<Any>, val isAbstract: Bool)
+data class ClassInfo(val name: String, val isTrait: Bool, val isData: Bool, val isAbstract: Bool, val mro: Vec<String>,
+                     val fields: Vec<FieldInfo>, val ownMethods: Vec<String>, val methods: Map<String, MethodSig>,
+                     val hasInvariants: Bool)
+
+class Info {
+  var classes: Map<String, ClassInfo> = {}
+  var classOrder: Vec<String> = []
+  var enums: Map<String, Vec<Any>> = {}        // enum -> [[variant, [field names]]]
+  var variantOf: Map<String, String> = {}
+  var funs: Map<String, Vec<Any>> = {}         // fun -> params [[name, hasDefault]]
+  var generics: Map<String, Int> = {}
+
+  fun variantFields(v: String): Vec<String>? {
+    val en = variantOf[v] ?: return nil
+    for x in enums[en] ?: [] { if x[0] == v { return x[1] } }
+    nil
+  }
+  fun classHasField(c: String, n: String): Bool = (classes[c]?.fields ?: []).any(|f| f.name == n)
+  fun classHasMethod(c: String, n: String): Bool = (classes[c]?.methods ?: {}).containsKey(n)
+}
+
+fun paramSigs(ps: Vec<Param>): Vec<Any> = ps.map(|p| [p.name, p.dflt != nil])
+
+class Checker(val decls: Vec<Decl>) {
+  val info: Info = Info()
+  var diags: Vec<Diag> = []
+  var ctorParams: Map<String, Vec<Any>> = {}
+  // body-check state
+  var scopes: Vec<Map<String, Any>> = []        // name -> [mutable, lambdaDepth]
+  var curClass: String? = nil
+  var inGeneric: Bool = false
+  var inEnsure: Bool = false
+  var lambdaDepth: Int = 0
+  var loopDepth: Int = 0
+
+  fun err(msg: String, span: Span) { diags = diags.push(Diag(msg, span)) }
+
+  // ------------------------------------------------------------------ collection
+  fun collect() {
+    info.enums = info.enums.assoc("Result", [["Ok", ["value"]], ["Err", ["error"]]])
+    info.variantOf = info.variantOf.assoc("Ok", "Result").assoc("Err", "Result")
+    var seen: Map<String, Bool> = {}
+    for d in decls {
+      val defs: Vec<Any> = match d {
+        DEnum(e) => [[e.name, e.span]] + e.variants.map(|v| [v.name, v.span])
+        DTypeAlias(t) => [[t.name, t.span]]
+        DClass(c) => [[c.name, c.span]]
+        DFun(f) => [[f.name, f.span]]
+        DGeneric(g) => [[g.name, g.span]]
+        DMethod(_) => []
+      }
+      for x in defs {
+        val n = x[0]
+        if seen.containsKey(n) || (isBuiltin(n) && n != "Ok" && n != "Err") { err("'$n' is already defined", x[1]) }
+        seen = seen.assoc(n, true)
+      }
+      match d {
+        DEnum(e) => {
+          info.enums = info.enums.assoc(e.name, e.variants.map(|v| [v.name, v.fields.map(|f| f.name)]))
+          for v in e.variants { info.variantOf = info.variantOf.assoc(v.name, e.name) }
+        }
+        DGeneric(g) => { info.generics = info.generics.assoc(g.name, g.params.count()) }
+        DFun(f) => { info.funs = info.funs.assoc(f.name, paramSigs(f.params)) }
+        DClass(c) => { ctorParams = ctorParams.assoc(c.name, paramSigs(c.params)) }
+        _ => {}
+      }
+    }
+    // classes in dependency order
+    var byName: Map<String, ClassDecl> = {}
+    var names: Vec<String> = []
+    for d in decls { match d { DClass(c) => { byName = byName.assoc(c.name, c); names = names.push(c.name) }, _ => {} } }
+    var state: Map<String, Int> = {}
+    var order: Vec<String> = []
+    val v = ClassVisitor(byName, this)
+    for n in names { v.visit(n) }
+    for n in v.order {
+      buildClass(byName[n]!!)
+      if info.classes.containsKey(n) { info.classOrder = info.classOrder.push(n) }
+    }
+    // generic methods
+    for d in decls {
+      match d {
+        DMethod(m) => {
+          val k = info.generics[m.name]
+          if k == nil { err("method for unknown generic function '${m.name}' (declare it with `generic ${m.name}(...)`)", m.span) }
+          else if k != m.params.count() { err("generic '${m.name}' takes $k parameters but this method has ${m.params.count()}", m.span) }
+          for p in m.params {
+            match p.ty {
+              TName(tn, _, tsp) => { if !isSpecializer(tn) { err("unknown specializer type '$tn'", tsp) } }
+              _ => {}
+            }
+          }
+        }
+        _ => {}
+      }
+    }
+  }
+
+  fun isSpecializer(n: String): Bool =
+    info.classes.containsKey(n) || info.enums.containsKey(n) || info.variantOf.containsKey(n) ||
+      ["Any", "Int", "Float", "Decimal", "Quantity", "String", "Bool", "Nil", "Vec", "Map", "Fn", "Sheet", "Atom", "Number"].contains(n)
+
+  fun buildClass(c: ClassDecl) {
+    if c.supers.any(|s| !info.classes.containsKey(s.name)) { return }
+    // C3 linearization
+    var seqs: Vec<Vec<String>> = c.supers.map(|s| info.classes[s.name]!!.mro)
+    seqs = seqs.push(c.supers.map(|s| s.name))
+    var mro: Vec<String> = [c.name]
+    while true {
+      seqs = seqs.filter(|s| !s.isEmpty())
+      if seqs.isEmpty() { break }
+      var cand: String? = nil
+      for s in seqs {
+        val h = s[0]!!
+        if !seqs.any(|t| t.drop(1).contains(h)) { cand = h; break }
+      }
+      if cand == nil { err("cannot compute a consistent method resolution order (C3) for '${c.name}'", c.span); return }
+      val h = cand!!
+      seqs = seqs.map(|s| if s[0] == h { s.drop(1) } else { s })
+      mro = mro.push(h)
+    }
+    for s in c.supers {
+      val p = info.classes[s.name]!!
+      if c.isTrait && !p.isTrait { err("trait '${c.name}' can only extend traits, but '${s.name}' is a class", s.span) }
+      if p.isTrait && s.args != nil { err("trait '${s.name}' has no constructor", s.span) }
+    }
+    // fields: inherited (furthest ancestor first), then own
+    var fields: Vec<FieldInfo> = []
+    for anc in mro.drop(1).reverse() {
+      for f in info.classes[anc]!!.fields {
+        if f.owner == anc && !fields.any(|x| x.name == f.name) { fields = fields.push(f) }
+      }
+    }
+    val ownDefs: Vec<Any> = c.params.filter(|p| p.field != nil).map(|p| [p.name, p.field == "var", p.span]) +
+      c.fields.map(|f| [f.name, f.mutable, f.span])
+    for od in ownDefs {
+      val existing = fields.find(|f| f.name == od[0])
+      if existing != nil { err("field '${od[0]}' is already defined in '${existing.owner}'", od[2]) }
+      else { fields = fields.push(FieldInfo(od[0], od[1], c.name)) }
+    }
+    // methods
+    var methods: Map<String, MethodSig> = {}
+    var own: Vec<String> = []
+    for m in c.methods {
+      val inherited = mro.drop(1).find(|a| info.classes[a]!!.ownMethods.contains(m.name))
+      if inherited != nil && !m.isOverride { err("'${m.name}' overrides a member of '$inherited' and needs the 'override' modifier", m.span) }
+      if inherited == nil && m.isOverride { err("'${m.name}' overrides nothing", m.span) }
+      if fields.any(|f| f.name == m.name) { err("'${m.name}' is both a field and a method", m.span) }
+      if own.contains(m.name) { err("method '${m.name}' is defined twice", m.span) }
+      own = own.push(m.name)
+      methods = methods.assoc(m.name, MethodSig(c.name, paramSigs(m.params), m.body == nil))
+    }
+    var inheritedNames: Vec<String> = []
+    for a in mro.drop(1) { inheritedNames = inheritedNames + info.classes[a]!!.ownMethods }
+    for n in inheritedNames.distinct().sort() {
+      if methods.containsKey(n) { continue }
+      val providers = mro.drop(1).filter(|a| {
+        val ci = info.classes[a]!!
+        ci.ownMethods.contains(n) && !ci.methods[n]!!.isAbstract
+      })
+      val maximal = providers.filter(|p| !providers.any(|q| q != p && info.classes[q]!!.mro.contains(p)))
+      if maximal.count() > 1 {
+        err("'${c.name}' inherits conflicting implementations of '$n' from ${maximal.map(|s| "'$s'").join(" and ")}; override it (call `super<${maximal[0]}>.$n()` to pick one)", c.span)
+        continue
+      }
+      val sig = if !maximal.isEmpty() { info.classes[maximal[0]!!]!!.methods[n]!! } else {
+        val a = mro.drop(1).find(|x| info.classes[x]!!.ownMethods.contains(n))!!
+        info.classes[a]!!.methods[n]!!
+      }
+      methods = methods.assoc(n, sig)
+    }
+    if !c.isAbstract {
+      val missing = methods.keys().filter(|n| methods[n]!!.isAbstract).sort()
+      if !missing.isEmpty() { err("class '${c.name}' must implement abstract member(s): ${missing.join(", ")}", c.span) }
+    }
+    val hasInv = !c.invariants.isEmpty() || mro.drop(1).any(|a| info.classes[a]!!.hasInvariants)
+    info.classes = info.classes.assoc(c.name, ClassInfo(c.name, c.isTrait, c.isData, c.isAbstract, mro, fields, own, methods, hasInv))
+  }
+
+  // ------------------------------------------------------------------ bodies
+  fun pushScope() { scopes = scopes.push({}) }
+  fun popScope() { scopes = scopes.take(scopes.count() - 1) }
+  fun declare(n: String, mutable: Bool) {
+    val top = scopes.last()!!
+    scopes = scopes.assoc(scopes.count() - 1, top.assoc(n, [mutable, lambdaDepth]))
+  }
+  fun lookup(n: String): Vec<Any>? {
+    var k = scopes.count() - 1
+    while k >= 0 {
+      val l = scopes[k]!![n]
+      if l != nil { return l }
+      k -= 1
+    }
+    nil
+  }
+  fun fieldOfCurrent(n: String): FieldInfo? {
+    val c = curClass ?: return nil
+    (info.classes[c]?.fields ?: []).find(|f| f.name == n)
+  }
+  fun methodOfCurrent(n: String): MethodSig? {
+    val c = curClass ?: return nil
+    (info.classes[c]?.methods ?: {})[n]
+  }
+
+  fun checkBodies() {
+    for d in decls {
+      match d {
+        DFun(f) => { scopes = [{}]; curClass = nil; checkFun(f) }
+        DClass(c) => checkClass(c)
+        DMethod(m) => {
+          scopes = [{}]; curClass = nil; inGeneric = true
+          for p in m.params { declare(p.name, false) }
+          expr(m.body)
+          inGeneric = false
+        }
+        _ => {}
+      }
+    }
+    if !decls.any(|d| match d { DFun(f) => f.name == "main", _ => false }) { err("program has no `fun main()`", Span(0, 0)) }
+  }
+
+  fun checkClass(c: ClassDecl) {
+    scopes = [{}]
+    curClass = c.name
+    for p in c.params {
+      if p.dflt != nil { expr(p.dflt!!) }
+      declare(p.name, false)
+    }
+    for s in c.supers {
+      val parent = info.classes[s.name]
+      if parent == nil || parent.isTrait { continue }
+      checkArgs("constructor of '${s.name}'", ctorParams[s.name] ?: [], s.args ?: [], s.span)
+    }
+    for f in c.fields { expr(f.init) }
+    for inv in c.invariants { expr(inv.expr) }
+    for m in c.methods {
+      scopes = [{}]
+      curClass = c.name
+      checkFun(m)
+    }
+    curClass = nil
+  }
+
+  fun checkFun(f: FunDecl) {
+    for p in f.params {
+      if p.dflt != nil { expr(p.dflt!!) }
+      declare(p.name, true)
+    }
+    for r in f.requires { expr(r.expr) }
+    if f.body != nil { expr(f.body!!) }
+    for o in f.olds { expr(o) }
+    inEnsure = true
+    pushScope()
+    declare("result", false)
+    for e in f.ensures { expr(e.expr) }
+    popScope()
+    inEnsure = false
+  }
+
+  fun checkArgs(what: String, params: Vec<Any>, args: Vec<Arg>, span: Span) {
+    var filled: Vec<Bool> = params.map(|_| false)
+    var pos = 0
+    var named = false
+    for a in args {
+      var idx = -1
+      if a.name != nil {
+        named = true
+        idx = params.indexOf(params.find(|p| p[0] == a.name))
+        if params.find(|p| p[0] == a.name) == nil {
+          err("$what has no parameter named '${a.name}'", a.value.span)
+          expr(a.value)
+          continue
+        }
+      } else {
+        if named { err("positional argument after named argument", a.value.span) }
+        idx = pos
+        pos += 1
+      }
+      if idx >= params.count() {
+        err("too many arguments for $what (expects ${params.count()})", a.value.span)
+        expr(a.value)
+        continue
+      }
+      if filled[idx] == true { err("parameter '${params[idx]!![0]}' given twice", a.value.span) }
+      filled = filled.assoc(idx, true)
+      expr(a.value)
+    }
+    for k in 0..params.count() {
+      val p = params[k]!!
+      if filled[k] == false && p[1] == false { err("missing argument '${p[0]}' for $what", span) }
+    }
+  }
+
+  fun block(b: Block) {
+    pushScope()
+    for s in b.stmts { stmt(s) }
+    popScope()
+  }
+
+  fun stmt(s: Stmt) {
+    match s {
+      SLet(mutable, n, _, init, sp) => {
+        expr(init)
+        if isBuiltin(n) || info.classes.containsKey(n) { err("'$n' shadows a global name", sp) }
+        declare(n, mutable)
+      }
+      SAssign(target, _, value, sp) => assign(target, value, sp)
+      SExpr(e) => expr(e)
+      SReturn(v, _) => { if v != nil { expr(v!!) } }
+      SWhile(c, b) => { expr(c); loopDepth += 1; block(b); loopDepth -= 1 }
+      SFor(n, it, b) => {
+        expr(it)
+        pushScope()
+        declare(n, false)
+        loopDepth += 1
+        block(b)
+        loopDepth -= 1
+        popScope()
+      }
+      SBreak(sp) => { if loopDepth == 0 { err("break/continue outside of a loop", sp) } }
+      SContinue(sp) => { if loopDepth == 0 { err("break/continue outside of a loop", sp) } }
+    }
+  }
+
+  fun assign(target: Expr, value: Expr, span: Span) {
+    match target.kind {
+      EIdent(n) => {
+        val l = lookup(n)
+        if l != nil {
+          if l[0] == false { err("cannot reassign 'val $n' (declare it with 'var')", target.span) }
+          if l[1] < lambdaDepth { err("cannot assign captured variable '$n' inside a lambda; use an atom: `val $n = atom(...)` and `$n.swap(...)`", target.span) }
+        } else {
+          val f = fieldOfCurrent(n)
+          if f != nil {
+            if !f.mutable { err("cannot assign to 'val' field '$n' of '${f.owner}'", target.span) }
+          } else { err("unresolved name '$n'", target.span) }
+        }
+        expr(value)
+      }
+      EMember(obj, _, _) => { expr(obj); expr(value) }
+      EIndex(obj, idx) => {
+        match obj.kind {
+          EIdent(b) => {
+            val l = lookup(b)
+            if l != nil && l[0] == false { err("cannot update 'val $b' (collections are persistent; declare it with 'var' to rebind)", target.span) }
+          }
+          _ => {}
+        }
+        expr(obj); expr(idx); expr(value)
+      }
+      _ => err("invalid assignment target", span)
+    }
+  }
+
+  fun ident(n: String, span: Span) {
+    if lookup(n) != nil || fieldOfCurrent(n) != nil || methodOfCurrent(n) != nil { return }
+    if info.funs.containsKey(n) || info.variantOf.containsKey(n) || info.classes.containsKey(n) { return }
+    if info.generics.containsKey(n) || isBuiltin(n) || n == "callNext" { return }
+    err("unresolved name '$n'", span)
+  }
+
+  fun exprs(es: Vec<Expr>) { for e in es { expr(e) } }
+  fun argExprs(args: Vec<Arg>) { for a in args { expr(a.value) } }
+
+  fun expr(e: Expr) {
+    match e.kind {
+      EStr(segs) => { for s in segs { match s { SegExpr(x) => expr(x), _ => {} } } }
+      EThis => { if curClass == nil { err("'this' outside of a class", e.span) } }
+      EResult => { if !inEnsure { err("'result' is only available in ensure clauses", e.span) } }
+      EOld(x, _) => { if !inEnsure { err("'old(...)' is only available in ensure clauses", e.span) }; expr(x) }
+      EIdent(n) => ident(n, e.span)
+      EQuantity(x, _) => expr(x)
+      EBinary(_, l, r) => { expr(l); expr(r) }
+      EUnary(_, x) => expr(x)
+      ECall(callee, args) => call(callee, args, e.span)
+      EMember(obj, _, _) => expr(obj)
+      ESuper(q, n, args) => {
+        if curClass == nil { err("'super' outside of a class", e.span) } else {
+          val ci = info.classes[curClass!!]!!
+          if q != nil {
+            if !ci.mro.contains(q!!) || q == curClass { err("'$q' is not a supertype of '${curClass}'", e.span) }
+            else if !info.classHasMethod(q!!, n) { err("'$q' has no method '$n'", e.span) }
+          } else if !ci.mro.drop(1).any(|a| info.classHasMethod(a, n)) {
+            err("no supertype of '${curClass}' defines '$n'", e.span)
+          }
+        }
+        argExprs(args)
+      }
+      EIndex(o, i) => { expr(o); expr(i) }
+      ELambda(ps, body) => {
+        pushScope()
+        lambdaDepth += 1
+        for p in ps { declare(p.name, false) }
+        val savedLoop = loopDepth
+        loopDepth = 0
+        expr(body)
+        loopDepth = savedLoop
+        lambdaDepth -= 1
+        popScope()
+      }
+      EIf(c, t, el) => { expr(c); block(t); if el != nil { block(el!!) } }
+      EMatch(s, arms) => matchExpr(s, arms)
+      EVec(items) => exprs(items)
+      EMap(entries) => { for en in entries { match en { MSpread(x) => expr(x), MKv(k, v) => { expr(k); expr(v) } } } }
+      ETry(x) => expr(x)
+      ENotNull(x) => expr(x)
+      ERange(a, b) => { expr(a); expr(b) }
+      EBlock(b) => block(b)
+      EIs(x, ty) => {
+        expr(x)
+        match ty { TName(tn, _, tsp) => { if !isSpecializer(tn) { err("unknown type '$tn'", tsp) } }, _ => {} }
+      }
+      ESheet(cells) => {
+        var seen: Vec<String> = []
+        for c in cells {
+          if seen.contains(c.cell) { err("cell ${c.cell} is defined twice", c.span) }
+          seen = seen.push(c.cell)
+          pushScope()
+          lambdaDepth += 1
+          expr(c.value)
+          lambdaDepth -= 1
+          popScope()
+        }
+      }
+      _ => {}
+    }
+  }
+
+  fun call(callee: Expr, args: Vec<Arg>, span: Span) {
+    match callee.kind {
+      EIdent(n) if lookup(n) == nil && fieldOfCurrent(n) == nil => {
+        if n == "callNext" {
+          if !inGeneric { err("callNext() is only available inside generic methods", callee.span) }
+          argExprs(args)
+          return nil
+        }
+        val m = methodOfCurrent(n)
+        if m != nil { checkArgs("method '$n'", m.params, args, span); return nil }
+        val f = info.funs[n]
+        if f != nil { checkArgs("function '$n'", f, args, span); return nil }
+        val ci = info.classes[n]
+        if ci != nil {
+          if ci.isAbstract { err("cannot instantiate ${if ci.isTrait { "trait" } else { "abstract class" }} '$n'", callee.span) }
+          checkArgs("constructor of '$n'", ctorParams[n] ?: [], args, span)
+          return nil
+        }
+        if info.variantOf.containsKey(n) {
+          val fields = info.variantFields(n) ?: []
+          if args.count() != fields.count() { err("variant '$n' takes ${fields.count()} value(s) but ${args.count()} were given", span) }
+          argExprs(args)
+          return nil
+        }
+        val k = info.generics[n]
+        if k != nil {
+          if args.count() != k { err("generic '$n' takes $k argument(s) but ${args.count()} were given", span) }
+          argExprs(args)
+          return nil
+        }
+        if isBuiltin(n) {
+          for a in args { if a.name != nil { err("builtin functions take positional arguments only", a.value.span) }; expr(a.value) }
+          return nil
+        }
+        err("unresolved function '$n'", callee.span)
+        argExprs(args)
+      }
+      _ => { expr(callee); argExprs(args) }
+    }
+  }
+
+  fun matchExpr(s: Expr, arms: Vec<MatchArm>) {
+    expr(s)
+    var catchAll = false
+    var covered: Vec<String> = []
+    val en = Atomic()
+    for a in arms {
+      pushScope()
+      pattern(a.pat, en)
+      if a.guard == nil {
+        match a.pat {
+          PWild => { catchAll = true }
+          PBind(_) => { catchAll = true }
+          PVariant(vn, pargs, _) => { if pargs.all(|p| match p { PWild => true, PBind(_) => true, _ => false }) { covered = covered.push(vn) } }
+          _ => {}
+        }
+      }
+      if a.guard != nil { expr(a.guard!!) }
+      expr(a.body)
+      popScope()
+    }
+    if !catchAll && en.value != nil {
+      val e = en.value!!
+      val missing = (info.enums[e] ?: []).map(|v| v[0]).filter(|v| !covered.contains(v))
+      if !missing.isEmpty() { err("non-exhaustive match on $e: missing ${missing.join(", ")}", s.span) }
+    }
+  }
+
+  fun pattern(p: Pattern, en: Atomic) {
+    match p {
+      PBind(n) => declare(n, false)
+      PLit(e) => expr(e)
+      PVariant(n, pargs, sp) => {
+        val e = info.variantOf[n]
+        if e == nil { err("unknown enum variant '$n'", sp) } else {
+          if en.value == nil { en.value = e } else if en.value != e { err("variant '$n' belongs to '$e', not '${en.value}'", sp) }
+          val k = (info.variantFields(n) ?: []).count()
+          if pargs.count() != k { err("pattern '$n' expects $k field(s) but has ${pargs.count()}", sp) }
+        }
+        val inner = Atomic()
+        for a in pargs { pattern(a, inner) }
+      }
+      _ => {}
+    }
+  }
+}
+
+/// a mutable cell for state threaded through recursive helpers
+class Atomic {
+  var value: String? = nil
+}
+
+class ClassVisitor(val byName: Map<String, ClassDecl>, val checker: Checker) {
+  var state: Map<String, Int> = {}
+  var order: Vec<String> = []
+  fun visit(n: String) {
+    val st = state[n]
+    if st == 2 { return }
+    if st == 1 { checker.err("cyclic inheritance involving '$n'", byName[n]!!.span); return }
+    state = state.assoc(n, 1)
+    for s in byName[n]!!.supers {
+      if byName.containsKey(s.name) { visit(s.name) } else { checker.err("unknown superclass or trait '${s.name}'", s.span) }
+    }
+    state = state.assoc(n, 2)
+    order = order.push(n)
+  }
+}
+
+fun check(decls: Vec<Decl>): Result<Info, Vec<Diag>> {
+  val c = Checker(decls)
+  c.collect()
+  if c.diags.isEmpty() { c.checkBodies() }
+  if c.diags.isEmpty() { Ok(c.info) } else { Err(c.diags) }
+}

@@ -677,7 +677,19 @@ impl Checker {
                     cx.declare(name, declared.unwrap_or(t), *mutable);
                 }
                 Stmt::Assign { target, value, span, .. } => self.assign(target, value, *span, cx),
-                Stmt::Expr(e) => { last = self.expr(e, cx, if i + 1 == n { expected } else { None }); }
+                Stmt::Expr(e) => {
+                    last = self.expr(e, cx, if i + 1 == n { expected } else { None });
+                    // `if x == nil { return }` smart-casts x to non-null for the rest of the block
+                    if let ExprKind::If(c, then, None) = &e.kind {
+                        let ends = matches!(then.stmts.last(), Some(Stmt::Return(..) | Stmt::Break(_) | Stmt::Continue(_)))
+                            || matches!(then.stmts.last(), Some(Stmt::Expr(x)) if diverges(x));
+                        if let (true, (_, Some(name))) = (ends, nil_check(c)) {
+                            if let Some(l) = cx.lookup(&name).cloned() {
+                                cx.scopes.last_mut().unwrap().insert(name, Local { ty: l.ty.non_null(), ..l });
+                            }
+                        }
+                    }
+                }
                 Stmt::Return(v, span) => {
                     if cx.lambda_depth == 0 {
                         let t = v.as_ref().map(|e| self.expr(e, cx, cx.ret.clone().as_ref())).unwrap_or(Ty::Unit);
@@ -925,7 +937,9 @@ impl Checker {
             if diverges(r) { return lt.non_null(); } // `x ?: return y`
             return join(lt.non_null(), rt);
         }
-        let rt = self.expr(r, cx, None);
+        // smart casts flow into the right operand: `x != nil && x.f`, `x == nil || x.f`
+        let narrow = match op { "&&" => nil_check(l).0, "||" => nil_check(l).1, _ => None };
+        let rt = self.narrowed(narrow, cx, |me, cx| me.expr(r, cx, None));
         let num = |t: &Ty| matches!(t, Ty::Int | Ty::Float | Ty::Decimal | Ty::Any | Ty::Union(_));
         match op {
             "&&" | "||" => { self.expect(&lt, &Ty::Bool, l.span); self.expect(&rt, &Ty::Bool, r.span); Ty::Bool }
@@ -1252,6 +1266,11 @@ fn nil_check(c: &Expr) -> (Option<String>, Option<String>) {
             let (a, _) = nil_check(l);
             let (b, _) = nil_check(r);
             return (a.or(b), None);
+        }
+        if op == "||" {
+            let (_, a) = nil_check(l);
+            let (_, b) = nil_check(r);
+            return (None, a.or(b));
         }
     }
     (None, None)

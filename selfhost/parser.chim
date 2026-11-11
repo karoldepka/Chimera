@@ -1,0 +1,868 @@
+// Chimera parser (self-hosted). A line-by-line port of src/parser.rs.
+
+fun isCell(s: String): Bool {
+  val cs = s.chars()
+  var letters = 0
+  while letters < cs.count() && (cs[letters] ?: "") >= "A" && (cs[letters] ?: "") <= "Z" { letters += 1 }
+  if letters < 1 || letters > 3 || cs.count() <= letters { return false }
+  var k = letters
+  while k < cs.count() { if !isDigit(cs[k] ?: "") { return false }; k += 1 }
+  true
+}
+
+fun ordinalSuffix(n: Int): String {
+  val a = n.abs()
+  if a % 100 >= 11 && a % 100 <= 13 { return "th" }
+  match a % 10 {
+    1 => "st"
+    2 => "nd"
+    3 => "rd"
+    _ => "th"
+  }
+}
+
+fun parseProgram(src: Vec<String>): Result<Vec<Decl>, Diag> {
+  val toks = lex(src, 0)?
+  val p = Parser(toks, src, false)
+  var decls: Vec<Decl> = []
+  while !p.atEof() {
+    if p.isOp(";") { p.bump(); continue }
+    decls = decls.push(p.decl()?)
+  }
+  Ok(decls)
+}
+
+class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
+  var i: Int = 0
+
+  // ---------- token helpers
+  fun cur(): Tok = t[i]!!
+  fun peekTok(k: Int): Tok { val j = i + k; if j < t.count() { t[j]!! } else { t.last()!! } }
+  fun atEof(): Bool = cur().kind == "Eof"
+  fun tokIsOp(tk: Tok, v: String): Bool = tk.kind == "Op" && tk.value == v
+  fun isOp(v: String): Bool = tokIsOp(cur(), v)
+  fun isKw(v: String): Bool = cur().kind == "Kw" && cur().value == v
+  fun bump(): Tok { val x = cur(); if i < t.count() - 1 { i += 1 }; x }
+  fun here(): Span = Span(cur().start, cur().end)
+  fun prevEnd(): Int = (t[if i > 0 { i - 1 } else { 0 }]!!).end
+  fun sp(start: Span): Span { val e = prevEnd(); Span(start.start, if e > start.start { e } else { start.start }) }
+  fun desc(): String = if cur().kind == "Str" { "string" } else if cur().kind == "Eof" { "end of file" } else { cur().value }
+  fun err(msg: String): Diag = Diag(msg, here())
+  fun expectOp(v: String): Result<Tok, Diag> {
+    if !isOp(v) { return Err(err("expected '$v' but found '${desc()}'")) }
+    Ok(bump())
+  }
+  fun expectKw(v: String): Result<Tok, Diag> {
+    if !isKw(v) { return Err(err("expected '$v' but found '${desc()}'")) }
+    Ok(bump())
+  }
+  fun ident(): Result<String, Diag> {
+    if cur().kind == "Ident" { return Ok(bump().value) }
+    Err(err("expected identifier but found '${desc()}'"))
+  }
+  fun name(): Result<String, Diag> {
+    if cur().kind == "Ident" || cur().kind == "Kw" { return Ok(bump().value) }
+    Err(err("expected name but found '${desc()}'"))
+  }
+  fun curIdent(): String? = if cur().kind == "Ident" { cur().value } else { nil }
+  fun srcSlice(a: Int, b: Int): String {
+    var out = ""
+    for k in a..b { out = out & (src[k] ?: "") }
+    out
+  }
+
+  // ---------- declarations
+  fun decl(): Result<Decl, Diag> {
+    if isKw("fun") { return Ok(DFun(parseFun(false)?)) }
+    if isKw("class") || isKw("data") || isKw("abstract") || isKw("open") || isKw("trait") { return Ok(DClass(classDecl()?)) }
+    if isKw("enum") { return Ok(DEnum(enumDecl()?)) }
+    if isKw("type") { return Ok(DTypeAlias(typeAlias()?)) }
+    if isKw("struct") { return Ok(DTypeAlias(structDecl()?)) }
+    if isKw("generic") { return Ok(DGeneric(genericDecl()?)) }
+    if isKw("method") || isKw("before") || isKw("after") || isKw("around") { return Ok(DMethod(methodDecl()?)) }
+    Err(err("expected a declaration (fun, class, trait, enum, type, struct, generic, method) but found '${desc()}'"))
+  }
+
+  fun typeParams(): Result<Vec<String>, Diag> {
+    var out: Vec<String> = []
+    if isOp("<") {
+      bump()
+      while !isOp(">") { out = out.push(ident()?); if isOp(",") { bump() } }
+      bump()
+    }
+    Ok(out)
+  }
+
+  fun params(allowField: Bool): Result<Vec<Param>, Diag> {
+    expectOp("(")?
+    var ps: Vec<Param> = []
+    while !isOp(")") {
+      val st = here()
+      var field: String? = nil
+      if allowField && (isKw("val") || isKw("var")) { field = bump().value }
+      val nm = ident()?
+      var ty: TypeNode? = nil
+      if isOp(":") { bump(); ty = parseType()? }
+      var dflt: Expr? = nil
+      if isOp("=") { bump(); dflt = expr()? }
+      ps = ps.push(Param(nm, ty, dflt, field, sp(st)))
+      if isOp(",") { bump() } else if !isOp(")") { return Err(err("expected ',' or ')' in parameter list")) }
+    }
+    bump()
+    Ok(ps)
+  }
+
+  fun contracts(kw: String): Result<Vec<Contract>, Diag> {
+    expectKw(kw)?
+    var out: Vec<Contract> = []
+    while true {
+      var tag: String? = nil
+      if curIdent() != nil && tokIsOp(peekTok(1), ":") { tag = ident()?; bump() }
+      val es = here()
+      val e = expr()?
+      out = out.push(Contract(tag, e, srcSlice(es.start, prevEnd())))
+      if isOp(",") { bump() } else { break }
+    }
+    Ok(out)
+  }
+
+  fun parseFun(isOverride: Bool): Result<FunDecl, Diag> {
+    val st = expectKw("fun")?
+    typeParams()?
+    val nm = name()?
+    val ps = params(false)?
+    var ret: TypeNode? = nil
+    if isOp(":") { bump(); ret = parseType()? }
+    var requires: Vec<Contract> = []
+    var ensures: Vec<Contract> = []
+    while isKw("require") || isKw("ensure") {
+      if isKw("require") { requires = requires + contracts("require")? } else { ensures = ensures + contracts("ensure")? }
+    }
+    var body: Expr? = nil
+    if isOp("=") {
+      bump()
+      body = expr()?
+    } else if isOp("{") {
+      val bs = here()
+      val b = block()?
+      body = Expr(EBlock(b), sp(bs))
+    }
+    Ok(FunDecl(nm, ps, ret, requires, ensures, body, isOverride, sp(Span(st.start, st.end)), []))
+  }
+
+  fun classDecl(): Result<ClassDecl, Diag> {
+    val st = here()
+    var isData = false
+    var isAbstract = false
+    var isTrait = false
+    while true {
+      if isKw("data") { isData = true; bump() }
+      else if isKw("abstract") { isAbstract = true; bump() }
+      else if isKw("open") { bump() }
+      else { break }
+    }
+    if isKw("trait") { isTrait = true; bump() } else { expectKw("class")? }
+    val nm = ident()?
+    val ps = if isOp("(") { params(true)? } else { [] }
+    if isTrait && !ps.isEmpty() { return Err(err("trait '$nm' cannot have constructor parameters")) }
+    var supers: Vec<SuperRef> = []
+    if isOp(":") {
+      bump()
+      while true {
+        val ss = here()
+        val sname = ident()?
+        var sargs: Vec<Arg>? = nil
+        if isOp("(") && !cur().nl { sargs = parseArgs()? }
+        supers = supers.push(SuperRef(sname, sargs, sp(ss)))
+        if isOp(",") { bump() } else { break }
+      }
+    }
+    var methods: Vec<FunDecl> = []
+    var fields: Vec<FieldDecl> = []
+    var invariants: Vec<Contract> = []
+    if isOp("{") {
+      bump()
+      while !isOp("}") {
+        if atEof() { return Err(err("unterminated class body")) }
+        if isOp(";") { bump(); continue }
+        if isKw("override") { bump(); methods = methods.push(parseFun(true)?); continue }
+        if isKw("abstract") {
+          bump()
+          val f = parseFun(false)?
+          if f.body != nil { return Err(Diag("abstract fun '${f.name}' cannot have a body", f.span)) }
+          methods = methods.push(f)
+          continue
+        }
+        if isKw("fun") { methods = methods.push(parseFun(false)?); continue }
+        if isKw("invariant") { invariants = invariants + contracts("invariant")?; continue }
+        if isKw("val") || isKw("var") {
+          val fs = here()
+          val mutable = isKw("var")
+          bump()
+          val fname = ident()?
+          var ty: TypeNode? = nil
+          if isOp(":") { bump(); ty = parseType()? }
+          expectOp("=")?
+          val init = expr()?
+          if isTrait { return Err(Diag("trait '$nm' cannot declare state (field '$fname')", fs)) }
+          fields = fields.push(FieldDecl(mutable, fname, ty, init, sp(fs)))
+          continue
+        }
+        return Err(err("unexpected '${desc()}' in ${if isTrait { "trait" } else { "class" }} body"))
+      }
+      bump()
+    }
+    Ok(ClassDecl(nm, isTrait, isData, isAbstract || isTrait, ps, supers, methods, fields, invariants, sp(st)))
+  }
+
+  fun enumDecl(): Result<EnumDecl, Diag> {
+    val st = expectKw("enum")?
+    val nm = ident()?
+    expectOp("{")?
+    var variants: Vec<VariantDecl> = []
+    while !isOp("}") {
+      if isOp(",") || isOp(";") { bump(); continue }
+      val vs = here()
+      val vname = ident()?
+      val fields = if isOp("(") { params(false)? } else { [] }
+      variants = variants.push(VariantDecl(vname, fields, sp(vs)))
+    }
+    bump()
+    Ok(EnumDecl(nm, variants, sp(Span(st.start, st.end))))
+  }
+
+  fun typeAlias(): Result<TypeAliasDecl, Diag> {
+    val st = expectKw("type")?
+    val nm = ident()?
+    val tps = typeParams()?
+    expectOp("=")?
+    val ty = parseType()?
+    Ok(TypeAliasDecl(nm, tps, ty, sp(Span(st.start, st.end))))
+  }
+
+  fun structDecl(): Result<TypeAliasDecl, Diag> {
+    val st = expectKw("struct")?
+    val nm = ident()?
+    val tps = typeParams()?
+    val ty = recordType()?
+    Ok(TypeAliasDecl(nm, tps, ty, sp(Span(st.start, st.end))))
+  }
+
+  fun genericDecl(): Result<GenericDecl, Diag> {
+    val st = expectKw("generic")?
+    val nm = ident()?
+    val ps = params(false)?
+    if isOp(":") { bump(); parseType()? }
+    Ok(GenericDecl(nm, ps, sp(Span(st.start, st.end))))
+  }
+
+  fun methodDecl(): Result<MethodDecl, Diag> {
+    val tk = bump()
+    val qualifier = if tk.value == "method" { "primary" } else { tk.value }
+    val nm = ident()?
+    val ps = params(false)?
+    if isOp(":") { bump(); parseType()? }
+    var body: Expr? = nil
+    if isOp("=") {
+      bump()
+      body = expr()?
+    } else {
+      val bs = here()
+      val b = block()?
+      body = Expr(EBlock(b), sp(bs))
+    }
+    Ok(MethodDecl(qualifier, nm, ps, body!!, sp(Span(tk.start, tk.end))))
+  }
+
+  // ---------- types
+  fun parseType(): Result<TypeNode, Diag> {
+    val first = postfixType()?
+    if !isOp("|") { return Ok(first) }
+    var opts = [first]
+    while isOp("|") { bump(); opts = opts.push(postfixType()?) }
+    Ok(TUnion(opts))
+  }
+  fun postfixType(): Result<TypeNode, Diag> {
+    var ty = primaryType()?
+    while isOp("?") && !cur().nl { bump(); ty = TNullable(ty) }
+    Ok(ty)
+  }
+  fun primaryType(): Result<TypeNode, Diag> {
+    val st = here()
+    if isOp("(") {
+      bump()
+      var ps: Vec<TypeNode> = []
+      while !isOp(")") { ps = ps.push(parseType()?); if isOp(",") { bump() } }
+      bump()
+      if isOp("->") { bump(); val r = parseType()?; return Ok(TFn(ps, r)) }
+      if ps.count() != 1 { return Err(err("expected '->' after function type parameters")) }
+      return Ok(ps[0]!!)
+    }
+    if isOp("{") { return recordType() }
+    if cur().kind == "Str" {
+      var s = ""
+      for part in cur().parts { if !part.isExpr { s = s & part.text } }
+      bump()
+      return Ok(TStrLit(s))
+    }
+    if isKw("keyof") { bump(); val inner = postfixType()?; return Ok(TKeyOf(inner)) }
+    val nm = ident()?
+    var targs: Vec<TypeNode> = []
+    if isOp("<") {
+      bump()
+      while !isOp(">") {
+        targs = targs.push(parseType()?)
+        if isOp(",") { bump() } else if !isOp(">") { return Err(err("expected ',' or '>' in type arguments")) }
+      }
+      bump()
+    }
+    Ok(TName(nm, targs, sp(st)))
+  }
+  fun recordType(): Result<TypeNode, Diag> {
+    expectOp("{")?
+    var fields: Vec<RecordField> = []
+    while !isOp("}") {
+      if isOp(",") || isOp(";") { bump(); continue }
+      var readonly = false
+      if curIdent() == "readonly" && peekTok(1).kind == "Ident" { readonly = true; bump() }
+      val nm = name()?
+      var optional = false
+      if isOp("?") { optional = true; bump() }
+      expectOp(":")?
+      fields = fields.push(RecordField(nm, parseType()?, optional, readonly))
+    }
+    bump()
+    Ok(TRecord(fields))
+  }
+
+  // ---------- statements
+  fun block(): Result<Block, Diag> {
+    val st = expectOp("{")?
+    var stmts: Vec<Stmt> = []
+    while !isOp("}") {
+      if isOp(";") { bump(); continue }
+      if atEof() { return Err(err("unterminated block")) }
+      stmts = stmts.push(stmt()?)
+    }
+    bump()
+    Ok(Block(stmts, sp(Span(st.start, st.end))))
+  }
+
+  fun stmt(): Result<Stmt, Diag> {
+    val st = here()
+    if isKw("val") || isKw("var") {
+      val mutable = isKw("var")
+      bump()
+      val nm = ident()?
+      var ty: TypeNode? = nil
+      if isOp(":") { bump(); ty = parseType()? }
+      expectOp("=")?
+      val init = expr()?
+      return Ok(SLet(mutable, nm, ty, init, sp(st)))
+    }
+    if isKw("return") {
+      bump()
+      var v: Expr? = nil
+      if !cur().nl && !isOp("}") && !isOp(";") { v = expr()? }
+      return Ok(SReturn(v, sp(st)))
+    }
+    if isKw("while") {
+      bump()
+      val c = expr()?
+      val b = block()?
+      return Ok(SWhile(c, b))
+    }
+    if isKw("for") {
+      bump()
+      val paren = isOp("(")
+      if paren { bump() }
+      val nm = ident()?
+      expectKw("in")?
+      val it = expr()?
+      if paren { expectOp(")")? }
+      val b = block()?
+      return Ok(SFor(nm, it, b))
+    }
+    if isKw("break") { bump(); return Ok(SBreak(st)) }
+    if isKw("continue") { bump(); return Ok(SContinue(st)) }
+    val e = expr()?
+    for op in ["=", "+=", "-=", "*=", "/="] {
+      if isOp(op) {
+        bump()
+        val value = expr()?
+        val okTarget = match e.kind {
+          EIdent(_) => true
+          EMember(_, _, _) => true
+          EIndex(_, _) => true
+          _ => false
+        }
+        if !okTarget { return Err(Diag("invalid assignment target", e.span)) }
+        return Ok(SAssign(e, op, value, sp(st)))
+      }
+    }
+    Ok(SExpr(e))
+  }
+
+  // ---------- expressions
+  fun expr(): Result<Expr, Diag> = thread()
+
+  fun binOpHere(ops: Vec<String>, leadingOk: Bool): String? {
+    if cur().kind == "Op" && ops.contains(cur().value) && (leadingOk || !cur().nl) { return cur().value }
+    nil
+  }
+  fun mkBin(op: String, l: Expr, r: Expr): Expr {
+    val o = if op == "<>" { "!=" } else { op }
+    Expr(EBinary(o, l, r), spanTo(l.span, r.span))
+  }
+  fun thread(): Result<Expr, Diag> {
+    var l = orExpr()?
+    while true {
+      val op = binOpHere(["->", "->>"], true) ?: break
+      bump()
+      val r = orExpr()?
+      val ok = match r.kind {
+        ECall(_, _) => true
+        EIdent(_) => true
+        ELambda(_, _) => true
+        _ => false
+      }
+      if !ok { return Err(Diag("right side of '$op' must be a function call or function", r.span)) }
+      l = Expr(EThread(op, l, r), spanTo(l.span, r.span))
+    }
+    Ok(l)
+  }
+  fun orExpr(): Result<Expr, Diag> {
+    var l = andExpr()?
+    while binOpHere(["||"], true) != nil { bump(); val r = andExpr()?; l = mkBin("||", l, r) }
+    Ok(l)
+  }
+  fun andExpr(): Result<Expr, Diag> {
+    var l = equality()?
+    while binOpHere(["&&"], true) != nil { bump(); val r = equality()?; l = mkBin("&&", l, r) }
+    Ok(l)
+  }
+  fun equality(): Result<Expr, Diag> {
+    var l = comparison()?
+    while true {
+      val op = binOpHere(["==", "!=", "<>"], false) ?: break
+      bump(); val r = comparison()?; l = mkBin(op, l, r)
+    }
+    Ok(l)
+  }
+  fun comparison(): Result<Expr, Diag> {
+    var l = concat()?
+    while true {
+      if isKw("is") && !cur().nl {
+        bump()
+        val ty = parseType()?
+        l = Expr(EIs(l, ty), sp(l.span))
+        continue
+      }
+      val op = binOpHere(["<", "<=", ">", ">="], false) ?: break
+      bump(); val r = concat()?; l = mkBin(op, l, r)
+    }
+    Ok(l)
+  }
+  fun concat(): Result<Expr, Diag> {
+    var l = elvis()?
+    while binOpHere(["&"], false) != nil { bump(); val r = elvis()?; l = mkBin("&", l, r) }
+    Ok(l)
+  }
+  fun elvis(): Result<Expr, Diag> {
+    var l = rangeExpr()?
+    while binOpHere(["?:"], true) != nil { bump(); val r = rangeExpr()?; l = mkBin("?:", l, r) }
+    Ok(l)
+  }
+  fun rangeExpr(): Result<Expr, Diag> {
+    val l = additive()?
+    if binOpHere([".."], false) != nil {
+      bump()
+      val r = additive()?
+      return Ok(Expr(ERange(l, r), spanTo(l.span, r.span)))
+    }
+    Ok(l)
+  }
+  fun additive(): Result<Expr, Diag> {
+    var l = multiplicative()?
+    while true {
+      val op = binOpHere(["+", "-"], false) ?: break
+      bump(); val r = multiplicative()?; l = mkBin(op, l, r)
+    }
+    Ok(l)
+  }
+  fun multiplicative(): Result<Expr, Diag> {
+    var l = power()?
+    while true {
+      val op = binOpHere(["*", "/", "%"], false) ?: break
+      if op == "%" && !canStartOperand(peekTok(1)) { break }
+      bump(); val r = power()?; l = mkBin(op, l, r)
+    }
+    Ok(l)
+  }
+  fun power(): Result<Expr, Diag> {
+    val l = unary()?
+    if binOpHere(["^"], false) != nil { bump(); val r = power()?; return Ok(mkBin("^", l, r)) }
+    Ok(l)
+  }
+  fun unary(): Result<Expr, Diag> {
+    val st = here()
+    if isOp("-") || isOp("!") || isOp("+") {
+      val op = bump().value
+      val e = unary()?
+      if op == "+" { return Ok(e) }
+      if op == "-" {
+        match e.kind {
+          EInt(v) => { return Ok(Expr(EInt(-v), sp(st))) }
+          EFloat(v) => { return Ok(Expr(EFloat(-v), sp(st))) }
+          EDecimal(v) => { return Ok(Expr(EDecimal("-$v"), sp(st))) }
+          _ => {}
+        }
+      }
+      return Ok(Expr(EUnary(op, e), sp(st)))
+    }
+    if isOp("@") {
+      bump()
+      val e = unary()?
+      val s = sp(st)
+      val m = Expr(EMember(e, "deref", false), s)
+      return Ok(Expr(ECall(m, []), s))
+    }
+    postfix()
+  }
+
+  fun canStartOperand(tk: Tok): Bool {
+    if tk.nl { return false }
+    match tk.kind {
+      "Ident" => true
+      "Int" => true
+      "Float" => true
+      "Decimal" => true
+      "Str" => true
+      "Kw" => ["true", "false", "nil", "this", "result", "old", "if", "match", "sheet", "super"].contains(tk.value)
+      "Op" => ["(", "[", "{", "|", "-", "!", "@"].contains(tk.value)
+      _ => false
+    }
+  }
+
+  fun postfix(): Result<Expr, Diag> {
+    val st = here()
+    var e = primary()?
+    while true {
+      if isOp("(") && !cur().nl {
+        val a = parseArgs()?
+        e = Expr(ECall(e, a), sp(st))
+      } else if isOp("[") && !cur().nl {
+        bump()
+        val idx = expr()?
+        expectOp("]")?
+        e = Expr(EIndex(e, idx), sp(st))
+      } else if isOp(".") || isOp("?.") {
+        val safe = isOp("?.")
+        bump()
+        val nm = name()?
+        e = Expr(EMember(e, nm, safe), sp(st))
+      } else if isOp("!!") && !cur().nl {
+        bump()
+        e = Expr(ENotNull(e), sp(st))
+      } else if isOp("?") && !cur().nl {
+        bump()
+        e = Expr(ETry(e), sp(st))
+      } else if isOp("%") && !cur().nl && !canStartOperand(peekTok(1)) {
+        bump()
+        e = Expr(EPercent(e), sp(st))
+      } else {
+        break
+      }
+    }
+    Ok(e)
+  }
+
+  fun parseArgs(): Result<Vec<Arg>, Diag> {
+    expectOp("(")?
+    var out: Vec<Arg> = []
+    while !isOp(")") {
+      if curIdent() != nil && tokIsOp(peekTok(1), "=") {
+        val nm = ident()?
+        bump()
+        out = out.push(Arg(nm, expr()?))
+      } else {
+        out = out.push(Arg(nil, expr()?))
+      }
+      if isOp(",") || isOp(";") { bump() } else if !isOp(")") { return Err(err("expected ',' or ')' in argument list")) }
+    }
+    bump()
+    Ok(out)
+  }
+
+  fun looksLikeMap(): Bool {
+    val a = peekTok(1)
+    val b = peekTok(2)
+    if tokIsOp(a, "}") || tokIsOp(a, "...") { return true }
+    (a.kind == "Ident" || a.kind == "Str" || a.kind == "Int") && tokIsOp(b, ":")
+  }
+  fun blockOrExpr(): Result<Expr, Diag> {
+    if isOp("{") && !looksLikeMap() {
+      val st = here()
+      val b = block()?
+      return Ok(Expr(EBlock(b), sp(st)))
+    }
+    expr()
+  }
+
+  fun subParse(text: String, offset: Int): Result<Expr, Diag> {
+    val toks = lex(text.chars(), offset)?
+    val p = Parser(toks, src, inSheet)
+    val e = p.expr()?
+    if !p.atEof() { return Err(p.err("unexpected token in string template")) }
+    Ok(e)
+  }
+
+  fun unitSuffix(e: Expr): Result<Expr, Diag> {
+    if cur().kind == "Ident" && !cur().nl && !(inSheet && isCell(cur().value)) {
+      val u = cur().value
+      val span = spanTo(e.span, here())
+      val adjacent = cur().start == e.span.end
+      bump()
+      if adjacent && ["st", "nd", "rd", "th"].contains(u) {
+        val n = match e.kind {
+          EInt(v) => v
+          _ => { return Err(Diag("ordinal suffixes need an integer, e.g. 3rd", span)) }
+        }
+        val want = ordinalSuffix(n)
+        if want != u { return Err(Diag("ordinal $n is written $n$want", span)) }
+        return Ok(Expr(EQuantity(e, "ord"), span))
+      }
+      return Ok(Expr(EQuantity(e, u), span))
+    }
+    Ok(e)
+  }
+
+  fun primary(): Result<Expr, Diag> {
+    val st = here()
+    val tk = cur()
+    if tk.kind == "Int" {
+      bump()
+      val n = tk.value.toInt() ?: return Err(Diag("integer literal out of range", st))
+      return unitSuffix(Expr(EInt(n), st))
+    }
+    if tk.kind == "Float" { bump(); return unitSuffix(Expr(EFloat(tk.value.toFloat()!!), st)) }
+    if tk.kind == "Decimal" { bump(); return unitSuffix(Expr(EDecimal(tk.value), st)) }
+    if tk.kind == "Str" {
+      bump()
+      var segs: Vec<StrSeg> = []
+      for part in tk.parts {
+        if part.isExpr { segs = segs.push(SegExpr(subParse(part.text, part.offset)?)) } else { segs = segs.push(SegLit(part.text)) }
+      }
+      return Ok(Expr(EStr(segs), st))
+    }
+    if tk.kind == "Ident" {
+      bump()
+      if inSheet && isCell(tk.value) {
+        if isOp(":") && !cur().nl {
+          val nx = peekTok(1)
+          if nx.kind == "Ident" && isCell(nx.value) {
+            bump()
+            bump()
+            return Ok(Expr(ECellRange(tk.value, nx.value), sp(st)))
+          }
+        }
+        return Ok(Expr(ECellRef(tk.value), st))
+      }
+      return Ok(Expr(EIdent(tk.value), st))
+    }
+    if tk.kind == "Kw" {
+      val k = tk.value
+      if k == "true" || k == "false" { bump(); return Ok(Expr(EBool(k == "true"), st)) }
+      if k == "nil" { bump(); return Ok(Expr(ENil, st)) }
+      if k == "this" { bump(); return Ok(Expr(EThis, st)) }
+      if k == "result" { bump(); return Ok(Expr(EResult, st)) }
+      if k == "old" {
+        bump()
+        expectOp("(")?
+        val e = expr()?
+        expectOp(")")?
+        return Ok(Expr(EOld(e, 0), sp(st)))
+      }
+      if k == "super" {
+        bump()
+        var qualifier: String? = nil
+        if isOp("<") { bump(); qualifier = ident()?; expectOp(">")? }
+        expectOp(".")?
+        val nm = name()?
+        val a = parseArgs()?
+        return Ok(Expr(ESuper(qualifier, nm, a), sp(st)))
+      }
+      if k == "return" || k == "break" || k == "continue" {
+        val s = stmt()?
+        return Ok(Expr(EBlock(Block([s], sp(st))), sp(st)))
+      }
+      if k == "if" { return ifExpr() }
+      if k == "match" { return matchExpr() }
+      if k == "sheet" { return sheetExpr() }
+    }
+    if tk.kind == "Op" {
+      val o = tk.value
+      if o == "(" { bump(); val e = expr()?; expectOp(")")?; return Ok(e) }
+      if o == "[" {
+        bump()
+        var items: Vec<Expr> = []
+        while !isOp("]") {
+          items = items.push(expr()?)
+          if isOp(",") { bump() } else if !isOp("]") { return Err(err("expected ',' or ']'")) }
+        }
+        bump()
+        return Ok(Expr(EVec(items), sp(st)))
+      }
+      if o == "{" { return braceLiteral() }
+      if o == "|" || o == "||" { return lambda() }
+      if o == "=" && inSheet { bump(); return expr() }
+    }
+    Err(err("unexpected '${desc()}'"))
+  }
+
+  fun isKey(): Bool = (cur().kind == "Ident" || cur().kind == "Kw") && tokIsOp(peekTok(1), ":")
+  fun isLitKey(): Bool = (cur().kind == "Str" || cur().kind == "Int") && tokIsOp(peekTok(1), ":")
+
+  fun braceLiteral(): Result<Expr, Diag> {
+    val stt = expectOp("{")?
+    val st = Span(stt.start, stt.end)
+    if isOp("}") { bump(); return Ok(Expr(EMap([]), sp(st))) }
+    if isOp("...") || isKey() || isLitKey() {
+      var entries: Vec<MapEntry> = []
+      while !isOp("}") {
+        if isOp("...") {
+          bump()
+          entries = entries.push(MSpread(expr()?))
+        } else {
+          val ks = here()
+          var key: Expr? = nil
+          if isKey() {
+            val nm = name()?
+            key = Expr(EStr([SegLit(nm)]), ks)
+          } else { key = expr()? }
+          expectOp(":")?
+          entries = entries.push(MKv(key!!, expr()?))
+        }
+        if isOp(",") { bump() } else if !isOp("}") { return Err(err("expected ',' or '}' in map literal")) }
+      }
+      bump()
+      return Ok(Expr(EMap(entries), sp(st)))
+    }
+    var rows: Vec<Vec<Expr>> = [[]]
+    while !isOp("}") {
+      val e = expr()?
+      val lastRow = rows.last()!!
+      rows = rows.assoc(rows.count() - 1, lastRow.push(e))
+      if isOp(",") { bump() }
+      else if isOp(";") { bump(); rows = rows.push([]) }
+      else if !isOp("}") { return Err(err("expected ',', ';' or '}' in array literal")) }
+    }
+    bump()
+    val s = sp(st)
+    if rows.count() == 1 { return Ok(Expr(EVec(rows[0]!!), s)) }
+    if rows.all(|r| r.count() == 1) { return Ok(Expr(EVec(rows.map(|r| r[0])), s)) }
+    Ok(Expr(EVec(rows.map(|r| Expr(EVec(r), s))), s))
+  }
+
+  fun lambda(): Result<Expr, Diag> {
+    val st = here()
+    var ps: Vec<Param> = []
+    if isOp("||") { bump() } else {
+      expectOp("|")?
+      while !isOp("|") {
+        val pst = here()
+        val nm = ident()?
+        var ty: TypeNode? = nil
+        if isOp(":") { bump(); ty = postfixType()? }
+        ps = ps.push(Param(nm, ty, nil, nil, sp(pst)))
+        if isOp(",") { bump() } else if !isOp("|") { return Err(err("expected ',' or '|' in lambda parameters")) }
+      }
+      bump()
+    }
+    val body = blockOrExpr()?
+    Ok(Expr(ELambda(ps, body), sp(st)))
+  }
+
+  fun ifExpr(): Result<Expr, Diag> {
+    val stt = expectKw("if")?
+    val c = expr()?
+    val th = block()?
+    var els: Block? = nil
+    if isKw("else") {
+      bump()
+      if isKw("if") {
+        val es = here()
+        val nested = ifExpr()?
+        els = Block([SExpr(nested)], sp(es))
+      } else {
+        els = block()?
+      }
+    }
+    Ok(Expr(EIf(c, th, els), sp(Span(stt.start, stt.end))))
+  }
+
+  fun matchExpr(): Result<Expr, Diag> {
+    val stt = expectKw("match")?
+    val subject = expr()?
+    expectOp("{")?
+    var arms: Vec<MatchArm> = []
+    while !isOp("}") {
+      if isOp(",") || isOp(";") { bump(); continue }
+      if atEof() { return Err(err("unterminated match")) }
+      val ast = here()
+      val pat = pattern()?
+      var guard: Expr? = nil
+      if isKw("if") { bump(); guard = expr()? }
+      expectOp("=>")?
+      val body = blockOrExpr()?
+      arms = arms.push(MatchArm(pat, guard, body, sp(ast)))
+    }
+    bump()
+    Ok(Expr(EMatch(subject, arms), sp(Span(stt.start, stt.end))))
+  }
+
+  fun pattern(): Result<Pattern, Diag> {
+    val st = here()
+    val id = curIdent()
+    if id != nil {
+      bump()
+      if id == "_" { return Ok(PWild) }
+      val first = id.substring(0, 1)
+      if first >= "A" && first <= "Z" {
+        var pargs: Vec<Pattern> = []
+        if isOp("(") {
+          bump()
+          while !isOp(")") { pargs = pargs.push(pattern()?); if isOp(",") { bump() } }
+          bump()
+        }
+        return Ok(PVariant(id, pargs, sp(st)))
+      }
+      return Ok(PBind(id))
+    }
+    val k = cur().kind
+    val litStart = k == "Int" || k == "Float" || k == "Decimal" || k == "Str" || isKw("nil") || isKw("true") || isKw("false") || isOp("-")
+    if litStart { return Ok(PLit(unary()?)) }
+    Err(err("invalid pattern '${desc()}'"))
+  }
+
+  fun sheetExpr(): Result<Expr, Diag> {
+    val stt = expectKw("sheet")?
+    expectOp("{")?
+    val prev = inSheet
+    inSheet = true
+    var cells: Vec<SheetCell> = []
+    while !isOp("}") {
+      if isOp(";") || isOp(",") { bump(); continue }
+      if atEof() { return Err(err("unterminated sheet")) }
+      val cs = here()
+      val cell = ident()?
+      if !isCell(cell) { return Err(Diag("'$cell' is not a cell reference like A1 or B12", cs)) }
+      expectOp("=")?
+      val value = expr()?
+      cells = cells.push(SheetCell(cell, value, sp(cs)))
+    }
+    bump()
+    inSheet = prev
+    Ok(Expr(ESheet(cells), sp(Span(stt.start, stt.end))))
+  }
+}
