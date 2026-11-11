@@ -1,0 +1,5 @@
+fun main() {
+  val price = 100 USD + 20 EUR
+  val bad = 5 kW + 3
+  val ok = 1 kW + 250 W
+}

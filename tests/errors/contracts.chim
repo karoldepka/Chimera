@@ -1,0 +1,14 @@
+enum Light { Red, Yellow, Green }
+fun next(l: Light): Light = match l {
+  Red => Green
+  Green => Yellow
+}
+fun f(x: Int): Int
+  require x > 0
+= old(x) + result
+fun main() {
+  val n = 1
+  n = 2
+  var total = 0
+  [1, 2].each(|x| { total = total + x })
+}

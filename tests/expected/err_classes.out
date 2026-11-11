@@ -1,0 +1,10 @@
+tests/errors/classes.chim:2:43: error: 'area' overrides a member of 'Shape' and needs the 'override' modifier
+    2 | class Square(val side: Decimal) : Shape { fun area(): Decimal = side * side }
+      |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/errors/classes.chim:3:1: error: class 'Circle' must implement abstract member(s): area
+    3 | class Circle(val r: Decimal) : Shape
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/errors/classes.chim:6:1: error: 'C' inherits conflicting implementations of 'hello' from 'A' and 'B'; override it (call `super<A>.hello()` to pick one)
+    6 | class C : A, B
+      | ^^^^^^^^^^^^^^
+3 errors found

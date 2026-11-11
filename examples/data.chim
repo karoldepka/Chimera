@@ -1,0 +1,66 @@
+// Records are Clojure-style immutable maps, typed structurally with
+// TypeScript utility types: Partial, Required, Readonly, Pick, Omit, Record, keyof.
+
+struct User {
+  id: Int,
+  name: String,
+  email: String?,
+  role: "admin" | "editor" | "viewer",
+  salary: Quantity<USD>
+}
+
+type UserPatch = Partial<Omit<User, "id">>
+type PublicUser = Readonly<Pick<User, "id" | "name" | "role">>
+type Limits = Record<"daily" | "monthly", Quantity<USD>>
+
+fun update(u: User, patch: UserPatch): User = {...u, ...patch}
+
+fun public(u: User): PublicUser = {id: u.id, name: u.name, role: u.role}
+
+fun domain(u: User): String {
+  // null safety: email is String?, so we must use ?. / ?: (or a nil check that smart-casts)
+  val email = u.email ?: return "no email"
+  val at = email.split("@")
+  at.last() ?: "?"
+}
+
+fun parseAge(s: String): Result<Int, String> {
+  val n = s.toInt()
+  if n == nil { return Err("not a number: $s") }
+  if n < 0 { return Err("negative: $n") }
+  Ok(n)
+}
+
+// `?` propagates Err like Rust
+fun totalAge(a: String, b: String): Result<Int, String> = Ok(parseAge(a)? + parseAge(b)?)
+
+fun main() {
+  var ada: User = {id: 1, name: "Ada", email: "ada@analytical.org", role: "admin", salary: 9500 USD}
+  val bob: User = {id: 2, name: "Bob", email: nil, role: "viewer", salary: 4200.50 USD}
+  println(public(ada))
+  println("domains: ${domain(ada)}, ${domain(bob)}")
+  println("bob's email length: ${bob.email?.length ?: 0}")
+
+  val promoted = update(bob, {role: "editor", salary: 5000 USD})
+  println(promoted)
+  ada.salary = ada.salary * 1.05          // functional update of a `var` record
+  println("${ada.name} now earns ${ada.salary}")
+
+  val limits: Limits = {daily: 250 USD, monthly: 4000 USD}
+  println("payroll: ${SUM([ada.salary, promoted.salary])} (limit ${limits.monthly})")
+
+  println(totalAge("30", "12"))
+  println(totalAge("30", "x"))
+  println(totalAge("-4", "1"))
+
+  // persistent collections + Clojure threading + atoms
+  val team = [ada, bob, promoted]
+  val names = team -> filter(|u| u.role != "viewer") -> map(|u| u.name) -> join(", ")
+  println("non-viewers: $names")
+  val counter = atom(0)
+  team.each(|u| counter.swap(|n| n + 1))
+  println("counted ${@counter} users")
+  val scores = {"ada": 10, "bob": 7}
+  val scores2 = scores.assoc("cy", 12).update("bob", |s| s + 1)
+  println("$scores -> $scores2")
+}

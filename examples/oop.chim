@@ -1,0 +1,70 @@
+// Multiple inheritance (C3 MRO, like Python/CLOS), traits with default methods,
+// Kotlin-style constructors, `override`, `super` and `super<T>` calls.
+
+trait Named {
+  abstract fun name(): String
+  fun greet(): String = "Hello, I am ${name()}"
+}
+
+trait Loggable {
+  fun log(msg: String) { println("[${describe()}] $msg") }
+  fun describe(): String = "object"
+}
+
+open class Animal(val label: String, var energy: Int = 10) : Named {
+  invariant energyNonNegative: energy >= 0
+
+  override fun name(): String = label
+  fun sound(): String = "..."
+  fun eat(amount: Int)
+    require positive: amount > 0
+    ensure energy == old(energy) + amount
+  {
+    energy = energy + amount
+  }
+  fun spend(amount: Int) { energy = energy - amount }
+}
+
+open class Flyer(var altitude: Int = 0) : Loggable {
+  fun move(): String = "flies at ${altitude}m"
+  override fun describe(): String = "flyer"
+}
+
+open class Swimmer(var depth: Int = 0) : Loggable {
+  fun move(): String = "swims at ${depth}m"
+  override fun describe(): String = "swimmer"
+}
+
+// Diamond: Duck -> Flyer -> Loggable, Duck -> Swimmer -> Loggable
+class Duck(label: String) : Animal(label, 5), Flyer(100), Swimmer(2) {
+  override fun sound(): String = "Quack"
+  // both Flyer and Swimmer define move(): Kotlin rules force us to resolve the conflict
+  override fun move(): String = super<Flyer>.move() + " and " + super<Swimmer>.move()
+  override fun describe(): String = "duck/" + super.describe()   // next in MRO after Duck
+}
+
+data class Point(val x: Decimal, val y: Decimal) {
+  fun plus(o: Point): Point = Point(x + o.x, y + o.y)
+  fun dist2(): Decimal = x * x + y * y
+}
+
+fun main() {
+  val d = Duck("Donald")
+  println(d.greet())
+  println("${d.name()} says ${d.sound()} and ${d.move()}")
+  d.log("energy is ${d.energy}")
+  d.eat(3)
+  println("after eating: ${d.energy}")
+  println("is Animal: ${d is Animal}, is Loggable: ${d is Loggable}, is Point: ${d is Point}")
+
+  val p = Point(1.5, 2.25)
+  val q = p.copy(y = 0.75)
+  println(p)
+  println(q)
+  println("p + q = ${p.plus(q)}, |p|^2 = ${p.dist2()}")
+  println("structural equality: ${Point(1.5, 2.25) == p}")
+
+  // Eiffel invariant: energy may never go negative
+  d.spend(100)
+  println("unreachable")
+}

@@ -1,0 +1,7 @@
+struct User { name: String, email: String? }
+fun main() {
+  val u: User = {name: "Ada", email: nil}
+  println(u.email.length)
+  val n: Int = nil
+  if u.email != nil { println(u.email) }
+}

@@ -1,0 +1,16 @@
+tests/errors/contracts.chim:2:35: error: non-exhaustive match on Light: missing Yellow
+    2 | fun next(l: Light): Light = match l {
+      |                                   ^
+tests/errors/contracts.chim:8:3: error: 'old(...)' is only available in ensure clauses
+    8 | = old(x) + result
+      |   ^^^^^^
+tests/errors/contracts.chim:8:12: error: 'result' is only available in ensure clauses
+    8 | = old(x) + result
+      |            ^^^^^^
+tests/errors/contracts.chim:11:3: error: cannot reassign 'val n' (declare it with 'var')
+   11 |   n = 2
+      |   ^
+tests/errors/contracts.chim:13:21: error: cannot assign captured variable 'total' inside a lambda; use an atom: `val total = atom(...)` and `total.swap(...)`
+   13 |   [1, 2].each(|x| { total = total + x })
+      |                     ^^^^^
+5 errors found

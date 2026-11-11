@@ -1,0 +1,52 @@
+// Google Sheets–style formulas, reactive `sheet` blocks, exact decimals and units of measure.
+
+fun vat(net: Quantity<USD>, rate: Decimal = 23%): Quantity<USD> = ROUND(net * rate, 2)
+
+fun main() {
+  // ---- a reactive spreadsheet: formulas recompute when inputs change
+  val budget = sheet {
+    A1 = "Rent";       B1 = 1200 USD
+    A2 = "Food";       B2 = 450.75 USD
+    A3 = "Transport";  B3 = 89.99 USD
+    A4 = "Total";      B4 = =SUM(B1:B3)
+    A5 = "Average";    B5 = ROUND(AVERAGE(B1:B3), 2)
+    A6 = "Biggest";    B6 = INDEX(A1:A3, MATCH(MAX(B1:B3), B1:B3))
+    C4 = IF(B4 > 1500 USD, "over budget", "ok")
+    D4 = "Total: " & B4 & " (" & C4 & ")"
+  }
+  println(budget.D4)
+  println("average ${budget.B5}, biggest item: ${budget.B6}")
+  budget.B2 = 120 USD                       // edit an input cell...
+  println(budget.D4)                        // ...dependent formulas update
+
+  // ---- Sheets functions work everywhere, not just in sheets
+  val sales = {120, 340.5, 99, 410, 75}     // Sheets array literal
+  println("total ${SUM(sales)}, avg ${AVERAGE(sales)}, median ${MEDIAN(sales)}")
+  println("big orders: ${COUNTIF(sales, ">100")}, their sum: ${SUMIF(sales, ">100")}")
+  println(TEXTJOIN(" | ", true, UPPER("chimera"), LEFT("language", 4), LEN("hello") & " chars"))
+  val prices = {"apple", 1.20; "pear", 0.95; "kiwi", 2.10}   // 2-D array
+  println("pear costs ${VLOOKUP("pear", prices, 2)}, mango: ${IFERROR(VLOOKUP("mango", prices, 2), "n/a")}")
+  val grade = |score: Int| IFS(score >= 90, "A", score >= 75, "B", score >= 50, "C", true, "F")
+  println(MAP({95, 80, 51, 12}, grade))
+  println(LET(x, 10, y, 32, x + y))
+  println(REDUCE(0, SEQUENCE(5), LAMBDA(acc, n, acc + n * n)))
+  println(SWITCH("PLN", "USD", "$", "EUR", "€", "PLN", "zł", "?"))
+
+  // ---- exact decimals: 1.0999 is a Decimal, not a binary float
+  println(0.1 + 0.2 == 0.3)                 // true  (Decimal)
+  println(0.1f + 0.2f == 0.3f)              // false (Float)
+  println(1.0999 * 3)
+  println(10 / 3.0)                          // Decimal division keeps 16 extra digits
+  println(ROUND(1.005, 2) & " vs float " & ROUND(1.005f, 2))  // 1.01 vs 1.0
+
+  // ---- units of measure
+  val net = 1999.99 USD
+  println("VAT on $net: ${vat(net)}, gross ${net + vat(net)}")
+  val heater = 2.5 kW
+  val energy = heater * 6 h                  // kW·h
+  println("energy: $energy, cost: ${energy * 0.32 USD / (1 kW * 1 h)}")
+  println("${1 kW + 750 W}, ${(1500 W).to("kW")}, ${3 km / 1500 m}")
+  val speeds = [12 km, 800 m, 2.5 km]
+  println("total distance ${SUM(speeds)}, longest ${MAX(speeds)}")
+  println(100 USD > 99.99 USD)
+}

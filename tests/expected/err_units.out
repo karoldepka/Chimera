@@ -1,0 +1,7 @@
+tests/errors/units.chim:2:25: error: cannot add USD and EUR: incompatible units
+    2 |   val price = 100 USD + 20 EUR
+      |                         ^^^^^^
+tests/errors/units.chim:3:13: error: cannot add a plain number and a quantity in kW; give the number a unit
+    3 |   val bad = 5 kW + 3
+      |             ^^^^^^^^
+2 errors found

@@ -1,0 +1,40 @@
+// CLOS-style generic functions: multiple dispatch on ALL arguments,
+// plus before / after / around methods and callNext() (call-next-method).
+
+abstract class Body(val name: String)
+class Asteroid(name: String) : Body(name)
+class Ship(name: String) : Body(name)
+class Station(name: String) : Body(name)
+
+generic collide(a, b)
+
+method collide(a: Body, b: Body) = "${a.name} and ${b.name} drift past each other"
+method collide(a: Asteroid, b: Ship) = "${b.name} is hit by ${a.name}!"
+method collide(a: Ship, b: Asteroid) = collide(b, a)
+method collide(a: Ship, b: Ship) = "${a.name} docks with ${b.name}"
+method collide(a: Ship, b: Body) = "${a.name} scans ${b.name}; " + callNext()
+
+before collide(a: Ship, b: Any) { println("  (shields up on ${a.name})") }
+after collide(a: Any, b: Station) { println("  (station log updated)") }
+around collide(a: Asteroid, b: Any) = "<<" + callNext() + ">>"
+
+// dispatch also works on primitive types, Decimal and quantities
+generic describe(x)
+method describe(x: Int) = "an Int: $x"
+method describe(x: Decimal) = "an exact Decimal: $x"
+method describe(x: Float) = "a binary Float: $x"
+method describe(x: Quantity) = "a quantity of ${x.amount} in ${x.unit}"
+method describe(x: Any) = "something else: $x"
+
+fun main() {
+  val a = Asteroid("Ceres")
+  val s = Ship("Rocinante")
+  val t = Ship("Tachi")
+  val st = Station("Tycho")
+  println(collide(a, s))
+  println(collide(s, a))
+  println(collide(s, t))
+  println(collide(s, st))
+  println(collide(a, st))
+  for x in [42, 1.0999, 1.5f, 230 kW, "hi"] { println(describe(x)) }
+}

@@ -1,0 +1,10 @@
+struct User { id: Int, name: String, role: "admin" | "viewer" }
+type Card = Readonly<Pick<User, "id" | "name">>
+type Wrong = Pick<User, "id" | "nickname">
+fun main() {
+  val a: User = {id: 1, name: "Ada"}
+  val b: User = {id: 2, name: "Bob", role: "owner"}
+  val c: User = {id: 3, name: "Cy", role: "viewer", age: 40}
+  var card: Card = {id: 1, name: "Ada"}
+  card.name = "Eve"
+}

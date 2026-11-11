@@ -1,0 +1,4 @@
+tests/errors/records.chim:3:14: error: key "nickname" does not exist in { id: Int, name: String, role: "admin" | "viewer" }
+    3 | type Wrong = Pick<User, "id" | "nickname">
+      |              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+1 error found

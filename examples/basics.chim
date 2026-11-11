@@ -1,0 +1,45 @@
+enum Shape {
+  Circle(r: Float),
+  Rect(w: Decimal, h: Decimal),
+  Empty
+}
+
+fun area(s: Shape): Decimal = match s {
+  Circle(r) => 3.14159 * r.toDecimal() * r.toDecimal()
+  Rect(w, h) if w == h => w * w
+  Rect(w, h) => w * h
+  Empty => 0.0
+}
+
+fun fact(n: Int): Int
+  require nonNegative: n >= 0
+  ensure result >= 1
+{
+  if n <= 1 { return 1 }
+  n * fact(n - 1)
+}
+
+fun main() {
+  val shapes = [Circle(2.0f), Rect(3.0, 4.0), Rect(2.5, 2.5), Empty]
+  for s in shapes {
+    println("$s -> ${area(s)}")
+  }
+  println(fact(10))
+  var total = 0
+  for i in 0..5 { total += i }
+  println("total = $total")
+  println(1.0999 + 0.0001)
+  println(0.1 + 0.2)
+  println(0.1f + 0.2f)
+  println(10 / 4)
+  println(10.0 / 4)
+  println(100 USD + 25.50 USD)
+  println(2 kW * 3 h)
+  println(1 kW + 500 W)
+  println(15% * 200 USD)
+  val m = {name: "Ada", age: 36}
+  println(m.name & " is " & m.age)
+  val xs = [1, 2, 3, 4] -> filter(|x| x % 2 == 0) -> MAP(LAMBDA(x, x * 10))
+  println(xs)
+  println(SUM(xs) & " / " & AVERAGE({1, 2, 3, 4}))
+}

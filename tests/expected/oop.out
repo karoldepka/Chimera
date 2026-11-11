@@ -1,0 +1,10 @@
+Hello, I am Donald
+Donald says Quack and flies at 100m and swims at 2m
+[duck/flyer] energy is 5
+after eating: 8
+is Animal: true, is Loggable: true, is Point: false
+Point(x=1.5, y=2.25)
+Point(x=1.5, y=0.75)
+p + q = Point(x=3.0, y=3.00), |p|^2 = 7.3125
+structural equality: true
+Error: invariant violation in Duck (class Animal): energyNonNegative: energy >= 0

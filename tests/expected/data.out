@@ -1,0 +1,12 @@
+{"id": 1, "name": "Ada", "role": "admin"}
+domains: analytical.org, no email
+bob's email length: 0
+{"id": 2, "name": "Bob", "email": nil, "role": "editor", "salary": 5000 USD}
+Ada now earns 9975.00 USD
+payroll: 14975.00 USD (limit 4000 USD)
+Ok(42)
+Err("not a number: x")
+Err("negative: -4")
+non-viewers: Ada, Bob
+counted 3 users
+{"ada": 10, "bob": 7} -> {"ada": 10, "bob": 8, "cy": 12}

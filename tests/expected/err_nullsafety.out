@@ -1,0 +1,7 @@
+tests/errors/nullsafety.chim:4:11: error: only safe (?.) or non-null asserted (!!.) access is allowed on a nullable receiver of type String?
+    4 |   println(u.email.length)
+      |           ^^^^^^^
+tests/errors/nullsafety.chim:5:16: error: type mismatch: nil cannot be assigned to non-nullable type Int (use Int?)
+    5 |   val n: Int = nil
+      |                ^^^
+2 errors found

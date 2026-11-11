@@ -1,0 +1,8 @@
+trait Shape { abstract fun area(): Decimal }
+class Square(val side: Decimal) : Shape { fun area(): Decimal = side * side }
+class Circle(val r: Decimal) : Shape
+open class A { fun hello(): String = "A" }
+open class B { fun hello(): String = "B" }
+class C : A, B
+class D(val x: Int) { fun set() { x = 5 } }
+fun main() { val s = Shape() }
