@@ -148,6 +148,8 @@ pub struct Contract {
     pub tag: Option<String>,
     pub expr: Expr,
     pub text: String,
+    /// set when the contract was inherited from an ancestor's declaration (e.g. "Shape.area")
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -159,6 +161,9 @@ pub struct FunDecl {
     pub ensures: Vec<Contract>,
     pub body: Option<Expr>,
     pub is_override: bool,
+    /// `require else` (weakening an inherited precondition) / `ensure then` (strengthening)
+    pub require_else: bool,
+    pub ensure_then: bool,
     pub span: Span,
     /// `old(...)` expressions collected from ensure clauses, indexed by slot
     pub olds: Vec<Expr>,

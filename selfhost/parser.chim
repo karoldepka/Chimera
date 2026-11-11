@@ -21,6 +21,8 @@ fun ordinalSuffix(n: Int): String {
   }
 }
 
+data class LoopContracts(val invs: Vec<Contract>, val variant: Contract?)
+
 fun parseProgram(src: Vec<String>): Result<Vec<Decl>, Diag> {
   val toks = lex(src, 0)?
   val p = Parser(toks, src, false)
@@ -32,8 +34,17 @@ fun parseProgram(src: Vec<String>): Result<Vec<Decl>, Diag> {
   Ok(decls)
 }
 
+fun contractText(kind: String, c: Contract): String =
+  if c.tag != nil { "$kind '${c.tag}' violated: ${c.text}" } else { "$kind violated: ${c.text}" }
+
+fun contractCall(f: String, cargs: Vec<Expr>, msg: String, span: Span): Expr {
+  val all = cargs.push(Expr(EStr([SegLit(msg)]), span))
+  Expr(ECall(Expr(EIdent(f), span), all.map(|x| Arg(nil, x))), span)
+}
+
 class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
   var i: Int = 0
+  var loops: Int = 0
 
   // ---------- token helpers
   fun cur(): Tok = t[i]!!
@@ -114,13 +125,17 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
 
   fun contracts(kw: String): Result<Vec<Contract>, Diag> {
     expectKw(kw)?
+    contractList()
+  }
+
+  fun contractList(): Result<Vec<Contract>, Diag> {
     var out: Vec<Contract> = []
     while true {
       var tag: String? = nil
       if curIdent() != nil && tokIsOp(peekTok(1), ":") { tag = ident()?; bump() }
       val es = here()
       val e = expr()?
-      out = out.push(Contract(tag, e, srcSlice(es.start, prevEnd())))
+      out = out.push(Contract(tag, e, srcSlice(es.start, prevEnd()), nil))
       if isOp(",") { bump() } else { break }
     }
     Ok(out)
@@ -135,8 +150,18 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
     if isOp(":") { bump(); ret = parseType()? }
     var requires: Vec<Contract> = []
     var ensures: Vec<Contract> = []
+    var requireElse = false
+    var ensureThen = false
     while isKw("require") || isKw("ensure") {
-      if isKw("require") { requires = requires + contracts("require")? } else { ensures = ensures + contracts("ensure")? }
+      if isKw("require") {
+        bump()
+        if isKw("else") { requireElse = true; bump() }
+        requires = requires + contractList()?
+      } else {
+        bump()
+        if curIdent() == "then" && !tokIsOp(peekTok(1), ":") { ensureThen = true; bump() }
+        ensures = ensures + contractList()?
+      }
     }
     var body: Expr? = nil
     if isOp("=") {
@@ -147,7 +172,7 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
       val b = block()?
       body = Expr(EBlock(b), sp(bs))
     }
-    Ok(FunDecl(nm, ps, ret, requires, ensures, body, isOverride, sp(Span(st.start, st.end)), []))
+    Ok(FunDecl(nm, ps, ret, requires, ensures, body, isOverride, requireElse, ensureThen, sp(Span(st.start, st.end)), []))
   }
 
   fun classDecl(): Result<ClassDecl, Diag> {
@@ -366,11 +391,19 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
       if !cur().nl && !isOp("}") && !isOp(";") { v = expr()? }
       return Ok(SReturn(v, sp(st)))
     }
+    if isKw("check") {
+      bump()
+      val cs = contractList()?
+      val stmts = cs.map(|c| SExpr(contractCall("__check", [c.expr], contractText("check", c), c.expr.span)))
+      return Ok(SExpr(Expr(EBlock(Block(stmts, sp(st))), sp(st))))
+    }
     if isKw("while") {
       bump()
       val c = expr()?
+      val lc = loopContracts()?
       val b = block()?
-      return Ok(SWhile(c, b))
+      if lc.invs.isEmpty() && lc.variant == nil { return Ok(SWhile(c, b)) }
+      return Ok(lowerLoop(c, nil, nil, lc, b, st))
     }
     if isKw("for") {
       bump()
@@ -380,8 +413,11 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
       expectKw("in")?
       val it = expr()?
       if paren { expectOp(")")? }
+      val lc = loopContracts()?
+      if lc.variant != nil { return Err(Diag("`variant` is only allowed on while loops (a for loop always terminates)", lc.variant!!.expr.span)) }
       val b = block()?
-      return Ok(SFor(nm, it, b))
+      if lc.invs.isEmpty() { return Ok(SFor(nm, it, b)) }
+      return Ok(lowerLoop(nil, nm, it, lc, b, st))
     }
     if isKw("break") { bump(); return Ok(SBreak(st)) }
     if isKw("continue") { bump(); return Ok(SContinue(st)) }
@@ -401,6 +437,44 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
       }
     }
     Ok(SExpr(e))
+  }
+
+  /// `invariant a, b  variant e` after a loop header
+  fun loopContracts(): Result<LoopContracts, Diag> {
+    var invs: Vec<Contract> = []
+    var variant: Contract? = nil
+    if isKw("invariant") { bump(); invs = contractList()? }
+    if curIdent() == "variant" {
+      bump()
+      val es = here()
+      val e = expr()?
+      variant = Contract(nil, e, srcSlice(es.start, prevEnd()), nil)
+    }
+    Ok(LoopContracts(invs, variant))
+  }
+
+  /// Lower loop contracts into plain code (see src/parser.rs `lower_loop`).
+  fun lowerLoop(cond: Expr?, forName: String?, forIter: Expr?, lc: LoopContracts, body: Block, st: Span): Stmt {
+    val span = sp(st)
+    val checks = lc.invs.map(|c| SExpr(contractCall("__check", [c.expr], contractText("loop invariant", c), c.expr.span)))
+    var stmts: Vec<Stmt> = []
+    var bodyStmts: Vec<Stmt> = []
+    if lc.variant != nil {
+      val v = lc.variant!!
+      loops += 1
+      val name = "__variant$loops"
+      stmts = stmts.push(SLet(true, name, nil, Expr(ENil, v.expr.span), v.expr.span))
+      val id = Expr(EIdent(name), v.expr.span)
+      val call = contractCall("__variant", [id, v.expr], "loop variant `${v.text}`", v.expr.span)
+      bodyStmts = bodyStmts.push(SAssign(id, "=", call, v.expr.span))
+    }
+    if cond != nil {
+      val condBlock = Expr(EBlock(Block(checks.push(SExpr(cond!!)), span)), span)
+      stmts = stmts.push(SWhile(condBlock, Block(bodyStmts + body.stmts, body.span)))
+    } else {
+      stmts = stmts.push(SFor(forName!!, forIter!!, Block(checks + body.stmts, body.span)))
+    }
+    SExpr(Expr(EBlock(Block(stmts, span)), span))
   }
 
   // ---------- expressions
@@ -618,7 +692,7 @@ class Parser(val t: Vec<Tok>, val src: Vec<String>, var inSheet: Bool) {
   }
 
   fun unitSuffix(e: Expr): Result<Expr, Diag> {
-    if cur().kind == "Ident" && !cur().nl && !(inSheet && isCell(cur().value)) {
+    if cur().kind == "Ident" && !cur().nl && !(inSheet && isCell(cur().value)) && cur().value != "variant" {
       val u = cur().value
       val span = spanTo(e.span, here())
       val adjacent = cur().start == e.span.end

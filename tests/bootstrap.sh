@@ -46,7 +46,7 @@ for f in $(find examples selfhost tests -name '*.chim' | sort); do
 done
 
 echo "== structural diagnostics (stage 2 vs stage 0)"
-for n in classes contracts ordinal_suffix; do
+for n in classes contracts ordinal_suffix dbc; do
   $S2 check "tests/errors/$n.chim" > "build/err_$n.s2" 2>&1
   same "diagnostics: $n" "tests/expected/err_$n.out" "build/err_$n.s2"
 done

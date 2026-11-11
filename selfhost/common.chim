@@ -127,8 +127,10 @@ fun formulaGo(e: Expr, found: NameAcc) {
   walk(e, |x| formulaGo(x, found))
 }
 
-fun contractMsg(kind: String, where_: String, c: Contract): String =
-  if c.tag != nil { "$kind '${c.tag}' violated in $where_: ${c.text}" } else { "$kind violated in $where_: ${c.text}" }
+fun contractMsg(kind: String, where_: String, c: Contract): String {
+  val at = if c.origin != nil { "$where_ (inherited from ${c.origin})" } else { where_ }
+  if c.tag != nil { "$kind '${c.tag}' violated in $at: ${c.text}" } else { "$kind violated in $at: ${c.text}" }
+}
 
 // ---- Rust source helpers
 

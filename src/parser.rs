@@ -18,7 +18,7 @@ pub fn ordinal_suffix(n: i64) -> &'static str {
 }
 
 pub fn parse(src: &str) -> PResult<Program> {
-    let mut p = Parser { t: lex(src, 0)?, i: 0, src, in_sheet: false };
+    let mut p = Parser { t: lex(src, 0)?, i: 0, src, in_sheet: false, loops: 0 };
     let mut decls = Vec::new();
     while !p.at_eof() {
         if p.is_op(";") { p.bump(); continue; }
@@ -32,6 +32,16 @@ struct Parser<'a> {
     i: usize,
     src: &'a str,
     in_sheet: bool,
+    loops: usize,
+}
+
+fn contract_text(kind: &str, c: &Contract) -> String {
+    match &c.tag { Some(t) => format!("{} '{}' violated: {}", kind, t, c.text), None => format!("{} violated: {}", kind, c.text) }
+}
+
+fn contract_call(f: &str, mut args: Vec<Expr>, msg: &str, span: Span) -> Expr {
+    args.push(Expr::new(ExprKind::Str(vec![StrSeg::Lit(msg.to_string())]), span));
+    Expr::new(ExprKind::Call(Box::new(Expr::new(ExprKind::Ident(f.to_string()), span)), args.into_iter().map(|value| Arg { name: None, value }).collect()), span)
 }
 
 impl<'a> Parser<'a> {
@@ -120,6 +130,10 @@ impl<'a> Parser<'a> {
 
     fn contracts(&mut self, kw: &str) -> PResult<Vec<Contract>> {
         self.expect_kw(kw)?;
+        self.contract_list()
+    }
+
+    fn contract_list(&mut self) -> PResult<Vec<Contract>> {
         let mut out = vec![];
         loop {
             let mut tag = None;
@@ -127,7 +141,7 @@ impl<'a> Parser<'a> {
             let es = self.here();
             let expr = self.expr()?;
             let text = self.src[es.start..self.prev_end()].to_string();
-            out.push(Contract { tag, expr, text });
+            out.push(Contract { tag, expr, text, origin: None });
             if self.is_op(",") { self.bump(); } else { break; }
         }
         Ok(out)
@@ -141,8 +155,19 @@ impl<'a> Parser<'a> {
         let ret = if self.is_op(":") { self.bump(); Some(self.ty()?) } else { None };
         let mut requires = vec![];
         let mut ensures = vec![];
+        let (mut require_else, mut ensure_then) = (false, false);
         while self.is_kw("require") || self.is_kw("ensure") {
-            if self.is_kw("require") { requires.extend(self.contracts("require")?); } else { ensures.extend(self.contracts("ensure")?); }
+            if self.is_kw("require") {
+                // `require else`: weaken an inherited precondition (Eiffel)
+                self.bump();
+                if self.is_kw("else") { require_else = true; self.bump(); }
+                requires.extend(self.contract_list()?);
+            } else {
+                // `ensure then`: strengthen an inherited postcondition
+                self.bump();
+                if self.cur_ident() == Some("then") && !Self::tok_is_op(self.peek(1), ":") { ensure_then = true; self.bump(); }
+                ensures.extend(self.contract_list()?);
+            }
         }
         let body = if self.is_op("=") {
             self.bump();
@@ -152,7 +177,7 @@ impl<'a> Parser<'a> {
             let b = self.block()?;
             Some(Expr::new(ExprKind::Block(b), self.sp(bs)))
         } else { None };
-        Ok(FunDecl { name, params, ret, requires, ensures, body, is_override, span: self.sp(st), olds: vec![] })
+        Ok(FunDecl { name, params, ret, requires, ensures, body, is_override, require_else, ensure_then, span: self.sp(st), olds: vec![] })
     }
 
     fn class_decl(&mut self) -> PResult<ClassDecl> {
@@ -363,11 +388,20 @@ impl<'a> Parser<'a> {
             let v = if !self.cur().nl_before && !self.is_op("}") && !self.is_op(";") { Some(self.expr()?) } else { None };
             return Ok(Stmt::Return(v, self.sp(st)));
         }
+        if self.is_kw("check") {
+            // Eiffel `check`: an assertion inside a body
+            self.bump();
+            let cs = self.contract_list()?;
+            let stmts = cs.into_iter().map(|c| Stmt::Expr(contract_call("__check", vec![c.expr.clone()], &contract_text("check", &c), c.expr.span))).collect();
+            return Ok(Stmt::Expr(Expr::new(ExprKind::Block(Block { stmts, span: self.sp(st) }), self.sp(st))));
+        }
         if self.is_kw("while") {
             self.bump();
             let c = self.expr()?;
+            let (invs, variant) = self.loop_contracts()?;
             let b = self.block()?;
-            return Ok(Stmt::While(c, b));
+            if invs.is_empty() && variant.is_none() { return Ok(Stmt::While(c, b)); }
+            return Ok(self.lower_loop(Some(c), None, invs, variant, b, st));
         }
         if self.is_kw("for") {
             self.bump();
@@ -377,8 +411,11 @@ impl<'a> Parser<'a> {
             self.expect_kw("in")?;
             let it = self.expr()?;
             if paren { self.expect_op(")")?; }
+            let (invs, variant) = self.loop_contracts()?;
+            if let Some(v) = &variant { return Err(Diag::new("`variant` is only allowed on while loops (a for loop always terminates)", v.expr.span)); }
             let b = self.block()?;
-            return Ok(Stmt::For(name, it, b));
+            if invs.is_empty() { return Ok(Stmt::For(name, it, b)); }
+            return Ok(self.lower_loop(None, Some((name, it)), invs, None, b, st));
         }
         if self.is_kw("break") { self.bump(); return Ok(Stmt::Break(st)); }
         if self.is_kw("continue") { self.bump(); return Ok(Stmt::Continue(st)); }
@@ -394,6 +431,56 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(Stmt::Expr(e))
+    }
+
+    /// `invariant a, b  variant e` after a loop header
+    fn loop_contracts(&mut self) -> PResult<(Vec<Contract>, Option<Contract>)> {
+        let mut invs = vec![];
+        let mut variant = None;
+        if self.is_kw("invariant") { self.bump(); invs = self.contract_list()?; }
+        if self.cur_ident() == Some("variant") {
+            self.bump();
+            let es = self.here();
+            let expr = self.expr()?;
+            variant = Some(Contract { tag: None, expr, text: self.src[es.start..self.prev_end()].to_string(), origin: None });
+        }
+        Ok((invs, variant))
+    }
+
+    /// Lower loop contracts into plain code:
+    ///   { var __variantN = nil
+    ///     while { __check(inv...); cond } { __variantN = __variant(__variantN, v, msg); body } }
+    /// The invariant is checked before every evaluation of the condition (so also on exit);
+    /// the variant must be a non-negative Int that strictly decreases on every iteration.
+    fn lower_loop(&mut self, cond: Option<Expr>, for_head: Option<(String, Expr)>, invs: Vec<Contract>, variant: Option<Contract>, body: Block, st: Span) -> Stmt {
+        let span = self.sp(st);
+        let checks: Vec<Stmt> = invs.iter().map(|c| Stmt::Expr(contract_call("__check", vec![c.expr.clone()], &contract_text("loop invariant", c), c.expr.span))).collect();
+        let mut stmts = vec![];
+        let mut body_stmts = vec![];
+        if let Some(v) = &variant {
+            self.loops += 1;
+            let var = format!("__variant{}", self.loops);
+            stmts.push(Stmt::Let { mutable: true, name: var.clone(), ty: None, init: Expr::new(ExprKind::Nil, v.expr.span), span: v.expr.span });
+            let id = Expr::new(ExprKind::Ident(var.clone()), v.expr.span);
+            let call = contract_call("__variant", vec![id.clone(), v.expr.clone()], &format!("loop variant `{}`", v.text), v.expr.span);
+            body_stmts.push(Stmt::Assign { target: id, op: "=".into(), value: call, span: v.expr.span });
+        }
+        match (cond, for_head) {
+            (Some(c), _) => {
+                let mut cs = checks;
+                cs.push(Stmt::Expr(c));
+                let cond = Expr::new(ExprKind::Block(Block { stmts: cs, span }), span);
+                body_stmts.extend(body.stmts);
+                stmts.push(Stmt::While(cond, Block { stmts: body_stmts, span: body.span }));
+            }
+            (None, Some((name, it))) => {
+                let mut b = checks;
+                b.extend(body.stmts);
+                stmts.push(Stmt::For(name, it, Block { stmts: b, span: body.span }));
+            }
+            _ => unreachable!(),
+        }
+        Stmt::Expr(Expr::new(ExprKind::Block(Block { stmts, span }), span))
     }
 
     // ---------- expressions ----------
@@ -601,7 +688,7 @@ impl<'a> Parser<'a> {
     }
 
     fn sub_parse(&self, text: &str, offset: usize) -> PResult<Expr> {
-        let mut p = Parser { t: lex(text, offset)?, i: 0, src: self.src, in_sheet: self.in_sheet };
+        let mut p = Parser { t: lex(text, offset)?, i: 0, src: self.src, in_sheet: self.in_sheet, loops: 0 };
         let e = p.expr()?;
         if !p.at_eof() { return p.err("unexpected token in string template"); }
         Ok(e)
@@ -703,7 +790,7 @@ impl<'a> Parser<'a> {
     /// A unit name directly after a number literal on the same line: `100 USD`, `2.5 kW`, `30 min`.
     fn unit_suffix(&mut self, e: Expr) -> PResult<Expr> {
         if let Tk::Ident(u) = &self.cur().tk {
-            if !self.cur().nl_before && !(self.in_sheet && is_cell(u)) {
+            if !self.cur().nl_before && !(self.in_sheet && is_cell(u)) && u != "variant" {
                 let u = u.clone();
                 let span = e.span.to(self.here());
                 let adjacent = self.cur().span.start == e.span.end;

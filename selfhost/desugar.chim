@@ -6,7 +6,7 @@ fun isSheetsLazy(n: String): Bool = ["IF", "IFS", "AND", "OR", "NOT", "LAMBDA", 
 fun blk(e: Expr): Block = Block([SExpr(e)], e.span)
 fun naErr(span: Span): Expr = Expr(ECall(Expr(EIdent("Err"), span), [Arg(nil, Expr(EStr([SegLit("#N/A")]), span))]), span)
 
-class Desugar(val globals: Map<String, Bool>) {
+class Desugar(val globals: Map<String, Bool>, val checks: Bool) {
   var tmp: Int = 0
   var olds: Vec<Expr> = []
 
@@ -190,6 +190,8 @@ class Desugar(val globals: Map<String, Bool>) {
       }
       ECall(callee, cargs) => match callee.kind {
         EIdent(n) if isSheetsLazy(n) => Ok(Expr(sheetsLazy(n, cargs, span)?, span))
+        // `check` / loop contracts are compiled out below `--contracts all`
+        EIdent(n) if (n == "__check" || n == "__variant") && !checks => Ok(Expr(ENil, span))
         _ => Ok(e)
       }
       _ => Ok(e)
@@ -324,7 +326,7 @@ fun mapStmt(s: Stmt, f: (Expr) -> Expr): Stmt = match s {
   _ => s
 }
 
-fun desugarProgram(decls: Vec<Decl>): Result<Vec<Decl>, Diag> {
+fun desugarProgram(decls: Vec<Decl>, level: String): Result<Vec<Decl>, Diag> {
   var globals: Map<String, Bool> = {}
   for d in decls {
     match d {
@@ -335,5 +337,5 @@ fun desugarProgram(decls: Vec<Decl>): Result<Vec<Decl>, Diag> {
       _ => {}
     }
   }
-  Desugar(globals).program(decls)
+  Desugar(globals, level == "all").program(decls)
 }

@@ -3,10 +3,11 @@
 //!
 //!   chimera check <file.chim>
 //!   chimera build <file.chim> --target rust|js [-o <out>]
-//!   chimera run   <file.chim> [--target rust|js]
+//!   chimera run   <file.chim> [--target rust|js]\n\n  --contracts all|pre|none   contract monitoring level (default: all)
 
 mod ast;
 mod common;
+mod contracts;
 mod desugar;
 mod diag;
 mod gen_js;
@@ -32,7 +33,7 @@ const RT_RS: &str = include_str!("../runtime/rt.rs");
 const RT_JS: &str = include_str!("../runtime/rt.js");
 
 fn usage() -> ! {
-    eprintln!("Chimera compiler {}\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> --target rust|js [-o <out>]\n  chimera run   <file.chim> [--target rust|js]\n  chimera emit  <file.chim> --target rust|js     (print generated code)\n  chimera tokens <file.chim>                    (dump the token stream)", env!("CARGO_PKG_VERSION"));
+    eprintln!("Chimera compiler {}\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> --target rust|js [-o <out>]\n  chimera run   <file.chim> [--target rust|js]\n\n  --contracts all|pre|none   contract monitoring level (default: all)\n  chimera emit  <file.chim> --target rust|js     (print generated code)\n  chimera tokens <file.chim>                    (dump the token stream)", env!("CARGO_PKG_VERSION"));
     exit(2)
 }
 
@@ -63,7 +64,7 @@ fn load(path: &Path, seen: &mut Vec<PathBuf>, out: &mut String, segs: &mut Vec<S
     segs.push(Segment { start, end: out.len(), file: path.display().to_string(), text: body, base: start });
 }
 
-fn compile(file: &str) -> (ast::Program, sema::Info) {
+fn compile(file: &str, level: contracts::Level) -> (ast::Program, sema::Info) {
     let mut src = String::new();
     let mut segs = vec![];
     load(Path::new(file), &mut vec![], &mut src, &mut segs);
@@ -77,8 +78,9 @@ fn compile(file: &str) -> (ast::Program, sema::Info) {
         exit(1)
     };
     let mut prog = parser::parse(&src).unwrap_or_else(|d| fail(vec![d]));
-    desugar::desugar(&mut prog).unwrap_or_else(|d| fail(vec![d]));
+    desugar::desugar(&mut prog, level).unwrap_or_else(|d| fail(vec![d]));
     let info = sema::check(&mut prog).unwrap_or_else(|d| fail(d));
+    contracts::apply(&mut prog, &info, level);
     let dir = Path::new(file).parent().map(|p| p.to_path_buf()).unwrap_or(PathBuf::from("."));
     BASE_DIR.with(|b| *b.borrow_mut() = dir);
     (prog, info)
@@ -91,17 +93,22 @@ fn main() {
     let file = &args[1];
     let mut target = "rust".to_string();
     let mut out: Option<String> = None;
+    let mut level = contracts::Level::All;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
             "--target" | "-t" => { target = args.get(i + 1).cloned().unwrap_or_else(|| usage()); i += 2; }
             "-o" => { out = args.get(i + 1).cloned(); i += 2; }
+            "--contracts" => {
+                level = args.get(i + 1).and_then(|s| contracts::Level::parse(s)).unwrap_or_else(|| { eprintln!("error: --contracts takes all, pre or none"); exit(2) });
+                i += 2;
+            }
             _ => usage(),
         }
     }
     if cmd == "tokens" { dump_tokens(file); return; }
     if target != "rust" && target != "js" { eprintln!("error: unknown target '{}' (use rust or js)", target); exit(2); }
-    let (prog, info) = compile(file);
+    let (prog, info) = compile(file, level);
     let stem = Path::new(file).file_stem().unwrap().to_string_lossy().to_string();
     match cmd {
         "check" => println!("{}: ok", file),

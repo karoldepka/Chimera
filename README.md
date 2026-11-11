@@ -33,7 +33,7 @@ fun main() {
 |---|---|
 | **Rust** | algebraic `enum`s, `match` with guards and **exhaustiveness checking**, `Result<T, E>` with the `?` operator, immutable by default, expression-oriented blocks |
 | **Kotlin** | `val`/`var`, primary constructors (`class P(val x: Int)`), `data class` with `copy(x = …)` and structural equality, null safety (`T?`, `?.`, `?:`, `!!`, smart casts), string templates `"$x ${y}"`, named and default arguments, mandatory `override`, `return` as an expression |
-| **Eiffel** | design by contract: `require`, `ensure` with `old(…)` and `result`, class `invariant`s checked after every qualified call |
+| **Eiffel** | full design by contract: `require`, `ensure` with `old(…)` and `result`, class `invariant`s; **contract inheritance** (overrides and trait implementations are held to their ancestors' contracts; `require else` weakens, `ensure then` strengthens); loop `invariant` / `variant`; `check`; monitoring levels (`--contracts all\|pre\|none`) |
 | **CLOS** | multiple inheritance with C3 linearization, generic functions with **multiple dispatch**, `before`/`after`/`around` methods, `callNext()` |
 | **Clojure** | persistent immutable vectors and maps, records as maps (`{...user, name: "x"}`), threading macros `->` / `->>`, atoms (`atom`, `swap`, `@a`) |
 | **TypeScript** | structural record types, literal and union types, `Partial`, `Required`, `Readonly`, `Pick`, `Omit`, `Record`, `NonNullable`, `Exclude`, `Extract`, `ReturnType`, `keyof`, excess-property checks |
@@ -65,6 +65,7 @@ You need Rust (cargo, rustc; rustfmt is optional) and, for the JS target, Node 1
 | `examples/data.chim` | records and utility types, null safety, `Result` and `?`, persistent collections, atoms |
 | `examples/sheets.chim` | reactive sheets, Sheets formulas, exact decimals, units of measure |
 | `examples/native.chim` | functions lowered to native Rust (`i64`/`f64`/`bool`) |
+| `examples/dbc.chim` | design by contract: inherited contracts, `require else` / `ensure then`, loop invariants and variants, `check` |
 | `examples/ordinals.chim` | ordinal vs cardinal numbers |
 | `examples/tour.chim` | everything together: a small energy-billing system |
 | `selfhost/*.chim` | the Chimera compiler, in Chimera |
@@ -87,7 +88,7 @@ You need Rust (cargo, rustc; rustfmt is optional) and, for the JS target, Node 1
 
 ## Self-hosting ✅
 
-The compiler compiles itself. `selfhost/` contains the full compiler written in Chimera (about 3,400 lines): lexer, parser, desugaring, semantic analysis, native lowering, the Rust backend, and a driver that writes and builds Cargo crates.
+The compiler compiles itself. `selfhost/` contains the full compiler written in Chimera (about 3,600 lines): lexer, parser, desugaring, semantic analysis, native lowering, the Rust backend, and a driver that writes and builds Cargo crates.
 
 ```
 stage 0  src/*.rs (Rust)        ──compiles──▶  stage 1  (selfhost/*.chim → Rust → native binary)
@@ -95,7 +96,7 @@ stage 1                         ──compiles──▶  stage 2
 stage 2 emits exactly what stage 1 emits  ⇒  fixpoint ✓
 ```
 
-`tests/bootstrap.sh` verifies all of this (46 checks):
+`tests/bootstrap.sh` verifies all of this (52 checks):
 * the fixpoint: stage 0, stage 1 and stage 2 emit the same 458 KB of Rust for the compiler itself;
 * every example: all stages emit byte-identical Rust, and the stage-2 binary runs it with the golden output;
 * the self-hosted lexer produces the same token stream as stage 0 on every `.chim` file;

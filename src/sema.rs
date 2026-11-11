@@ -145,6 +145,8 @@ pub const BUILTINS: &[&str] = &[
     "MATCH", "ISBLANK", "ISNUMBER", "ISTEXT", "ISERROR", "MAP", "REDUCE", "TRUE", "FALSE", "UNIT", "CONVERT",
     // system (needed for self-hosting)
     "readFile", "writeFile", "args", "exit", "eprintln", "exec", "mkdirs", "embedFile",
+    // contract helpers produced by the parser for `check` and loop invariants/variants
+    "__check", "__variant",
 ];
 
 pub fn is_builtin(n: &str) -> bool { BUILTINS.contains(&n) }
@@ -231,6 +233,7 @@ impl Checker {
         // functions
         for d in &p.decls {
             if let Decl::Fun(f) = d {
+                self.contract_rules(f);
                 let sig = self.fun_sig(f);
                 self.info.funs.insert(f.name.clone(), FunInfo { params: sig.0, ret: sig.1 });
             }
@@ -352,6 +355,7 @@ impl Checker {
         let mut methods: HashMap<String, MethodSig> = HashMap::new();
         let mut own_methods = vec![];
         for m in &c.methods {
+            self.contract_rules(m);
             let (params, ret) = self.fun_sig(m);
             let inherited = mro.iter().skip(1).find(|a| self.info.classes[*a].own_methods.contains(&m.name) || self.info.classes[*a].methods.get(&m.name).map_or(false, |s| s.owner == **a));
             if inherited.is_some() && !m.is_override {
@@ -400,6 +404,18 @@ impl Checker {
             name: c.name.clone(), is_trait: c.is_trait, is_data: c.is_data, is_abstract, mro, fields, own_fields, own_methods,
             methods, has_invariants, decl: idx,
         });
+    }
+
+    /// Eiffel/Liskov rules: an override may only weaken preconditions (`require else`)
+    /// and only strengthen postconditions (`ensure then`).
+    fn contract_rules(&mut self, f: &FunDecl) {
+        if f.is_override {
+            if !f.requires.is_empty() && !f.require_else { self.err(format!("'{}' overrides an inherited method, so it may only weaken the precondition: write `require else`", f.name), f.span); }
+            if !f.ensures.is_empty() && !f.ensure_then { self.err(format!("'{}' overrides an inherited method, so it may only strengthen the postcondition: write `ensure then`", f.name), f.span); }
+        } else {
+            if f.require_else { self.err(format!("`require else` is only allowed when overriding, and '{}' overrides nothing", f.name), f.span); }
+            if f.ensure_then { self.err(format!("`ensure then` is only allowed when overriding, and '{}' overrides nothing", f.name), f.span); }
+        }
     }
 
     fn fun_sig(&mut self, f: &FunDecl) -> (Vec<(String, Ty, bool)>, Ty) {

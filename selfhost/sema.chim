@@ -9,7 +9,8 @@ fun builtins(): Vec<String> = [
   "SQRT", "POWER", "MOD", "INT", "LEN", "UPPER", "LOWER", "TRIM", "LEFT", "RIGHT", "MID", "CONCATENATE", "TEXTJOIN",
   "SPLIT", "SUBSTITUTE", "SUMIF", "COUNTIF", "AVERAGEIF", "FILTER", "SORT", "UNIQUE", "SEQUENCE", "VLOOKUP", "INDEX",
   "MATCH", "ISBLANK", "ISNUMBER", "ISTEXT", "ISERROR", "MAP", "REDUCE", "TRUE", "FALSE", "UNIT", "CONVERT",
-  "readFile", "writeFile", "args", "exit", "eprintln", "exec", "mkdirs", "embedFile"
+  "readFile", "writeFile", "args", "exit", "eprintln", "exec", "mkdirs", "embedFile",
+  "__check", "__variant"
 ]
 fun isBuiltin(n: String): Bool = builtins().contains(n)
 
@@ -83,6 +84,7 @@ class Checker(val decls: Vec<Decl>) {
         _ => {}
       }
     }
+    for d in decls { match d { DFun(f) => contractRules(f), _ => {} } }
     // classes in dependency order
     var byName: Map<String, ClassDecl> = {}
     var names: Vec<String> = []
@@ -111,6 +113,17 @@ class Checker(val decls: Vec<Decl>) {
         }
         _ => {}
       }
+    }
+  }
+
+  /// Eiffel/Liskov: an override may only weaken preconditions and strengthen postconditions.
+  fun contractRules(f: FunDecl) {
+    if f.isOverride {
+      if !f.requires.isEmpty() && !f.requireElse { err("'${f.name}' overrides an inherited method, so it may only weaken the precondition: write `require else`", f.span) }
+      if !f.ensures.isEmpty() && !f.ensureThen { err("'${f.name}' overrides an inherited method, so it may only strengthen the postcondition: write `ensure then`", f.span) }
+    } else {
+      if f.requireElse { err("`require else` is only allowed when overriding, and '${f.name}' overrides nothing", f.span) }
+      if f.ensureThen { err("`ensure then` is only allowed when overriding, and '${f.name}' overrides nothing", f.span) }
     }
   }
 
@@ -160,6 +173,7 @@ class Checker(val decls: Vec<Decl>) {
     var methods: Map<String, MethodSig> = {}
     var own: Vec<String> = []
     for m in c.methods {
+      contractRules(m)
       val inherited = mro.drop(1).find(|a| info.classes[a]!!.ownMethods.contains(m.name))
       if inherited != nil && !m.isOverride { err("'${m.name}' overrides a member of '$inherited' and needs the 'override' modifier", m.span) }
       if inherited == nil && m.isOverride { err("'${m.name}' overrides nothing", m.span) }
@@ -552,7 +566,7 @@ class ClassVisitor(val byName: Map<String, ClassDecl>, val checker: Checker) {
   }
 }
 
-fun check(decls: Vec<Decl>): Result<Info, Vec<Diag>> {
+fun checkProgram(decls: Vec<Decl>): Result<Info, Vec<Diag>> {
   val c = Checker(decls)
   c.collect()
   if c.diags.isEmpty() { c.checkBodies() }

@@ -84,10 +84,12 @@ data class Block(val stmts: Vec<Stmt>, val span: Span)
 
 // `field` is "val", "var" or nil (class constructor parameters only)
 data class Param(val name: String, val ty: TypeNode?, val dflt: Expr?, val field: String?, val span: Span)
-data class Contract(val tag: String?, val expr: Expr, val text: String)
+// `origin` is set when the contract was inherited from an ancestor's declaration (e.g. "Shape.area")
+data class Contract(val tag: String?, val expr: Expr, val text: String, val origin: String?)
 
 data class FunDecl(val name: String, val params: Vec<Param>, val ret: TypeNode?, val requires: Vec<Contract>,
-                   val ensures: Vec<Contract>, val body: Expr?, val isOverride: Bool, val span: Span, val olds: Vec<Expr>)
+                   val ensures: Vec<Contract>, val body: Expr?, val isOverride: Bool, val requireElse: Bool,
+                   val ensureThen: Bool, val span: Span, val olds: Vec<Expr>)
 data class FieldDecl(val mutable: Bool, val name: String, val ty: TypeNode?, val init: Expr, val span: Span)
 data class SuperRef(val name: String, val args: Vec<Arg>?, val span: Span)
 data class ClassDecl(val name: String, val isTrait: Bool, val isData: Bool, val isAbstract: Bool, val params: Vec<Param>,

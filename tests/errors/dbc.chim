@@ -1,0 +1,16 @@
+open class Account(var balance: Int) {
+  fun withdraw(amount: Int): Int
+    require amount > 0
+    ensure result >= 0
+  { balance = balance - amount; balance }
+}
+class Strict(balance: Int) : Account(balance) {
+  override fun withdraw(amount: Int): Int
+    require amount > 10
+    ensure result >= 5
+  { balance = balance - amount; balance }
+}
+fun plain(x: Int): Int
+  require else x > 0
+= x
+fun main() { }

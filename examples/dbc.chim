@@ -1,0 +1,121 @@
+// Design by Contract, Eiffel-style.
+
+// ---- contracts on a trait are inherited by every implementation (Liskov) -------
+trait Stack {
+  abstract fun size(): Int
+  abstract fun top(): Int
+    require notEmpty: size() > 0
+
+  abstract fun push(x: Int)
+    ensure grew: size() == old(size()) + 1
+    ensure onTop: top() == x
+
+  abstract fun pop(): Int
+    require notEmpty: size() > 0
+    ensure shrank: size() == old(size()) - 1
+}
+
+class VecStack : Stack {
+  var items: Vec<Int> = []
+  invariant sizeNonNegative: size() >= 0
+
+  override fun size(): Int = items.count()
+  override fun top(): Int = items.last() ?: 0
+  override fun push(item: Int) { items = items.push(item) }       // note: parameter renamed
+  override fun pop(): Int {
+    val x = top()
+    items = items.take(items.count() - 1)
+    x
+  }
+}
+
+// A buggy implementation: the inherited postcondition catches it.
+class LossyStack : Stack {
+  var items: Vec<Int> = []
+  override fun size(): Int = items.count()
+  override fun top(): Int = items.last() ?: 0
+  override fun push(x: Int) { if x % 2 == 0 { items = items.push(x) } }   // silently drops odd numbers
+  override fun pop(): Int = 0
+}
+
+// ---- weakening preconditions, strengthening postconditions ---------------------
+open class Account(var balance: Int) {
+  fun withdraw(amount: Int): Int
+    require positive: amount > 0
+    require covered: amount <= balance
+    ensure result == old(balance) - amount
+  {
+    balance = balance - amount
+    balance
+  }
+}
+
+class CreditAccount(balance: Int, val limit: Int) : Account(balance) {
+  // accepts MORE than the parent (overdraft up to `limit`), promises MORE
+  override fun withdraw(amount: Int): Int
+    require else withinLimit: amount > 0 && amount <= balance + limit
+    ensure then balance >= -limit
+  {
+    balance = balance - amount
+    balance
+  }
+}
+
+// ---- loop invariants and variants, check ----------------------------------------
+fun gcd(a: Int, b: Int): Int
+  require a > 0, b > 0
+  ensure result > 0, a % result == 0, b % result == 0
+{
+  var x = a
+  var y = b
+  while y != 0
+    invariant x > 0, y >= 0
+    variant y                    // must decrease every iteration: proves termination
+  {
+    val t = x % y
+    x = y
+    y = t
+  }
+  x
+}
+
+fun sumTo(n: Int): Int
+  require n >= 0
+  ensure result == n * (n + 1) / 2
+{
+  var total = 0
+  var i = 0
+  while i < n
+    invariant partial: total == i * (i + 1) / 2
+    variant n - i
+  {
+    i += 1
+    total += i
+  }
+  check done: i == n
+  total
+}
+
+fun stuck(n: Int): Int {
+  var i = n
+  while i > 0 variant i { i = i - 0 }   // forgot to decrement
+  i
+}
+
+fun main() {
+  val s = VecStack()
+  s.push(1); s.push(2); s.push(3)
+  println("popped ${s.pop()}, size ${s.size()}")
+  println("gcd(84, 36) = ${gcd(84, 36)}, sumTo(100) = ${sumTo(100)}")
+
+  val acct = CreditAccount(100, 50)
+  println("credit: ${acct.withdraw(130)}")           // allowed by `require else`
+
+  val plain = Account(100)
+  println("plain: ${plain.withdraw(30)}")
+
+  val lossy = LossyStack()
+  lossy.push(4)
+  println("lossy size ${lossy.size()}")
+  lossy.push(7)                                        // violates the contract inherited from Stack.push
+}

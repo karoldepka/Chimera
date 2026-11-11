@@ -33,7 +33,7 @@ pub const KEYWORDS: &[&str] = &[
     "fun", "val", "var", "class", "trait", "data", "enum", "struct", "type", "abstract", "override", "open",
     "generic", "method", "before", "after", "around", "require", "ensure", "invariant", "old", "result",
     "if", "else", "while", "for", "in", "return", "break", "continue", "match", "true", "false", "nil",
-    "this", "super", "is", "keyof", "sheet",
+    "this", "super", "is", "keyof", "sheet", "check",
 ];
 
 // longest first

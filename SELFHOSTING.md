@@ -9,7 +9,7 @@ stage 2   selfhost/*.chim     compiled by stage 1
 fixpoint  stage1(compiler) == stage2(compiler), byte for byte
 ```
 
-Run `tests/bootstrap.sh` to rebuild every stage and verify (46 checks).
+Run `tests/bootstrap.sh` to rebuild every stage and verify (52 checks).
 
 | Component | Chimera source | Verified by | Status |
 |---|---|---|---|
@@ -17,6 +17,7 @@ Run `tests/bootstrap.sh` to rebuild every stage and verify (46 checks).
 | Parser + AST | `selfhost/parser.chim`, `ast.chim` | identical generated Rust for every program | ✅ |
 | Desugaring | `selfhost/desugar.chim` | same (including temporary numbering) | ✅ |
 | Structural checks | `selfhost/sema.chim` | identical diagnostics: classes, contracts, ordinal syntax | ✅ |
+| Design by Contract | `selfhost/contracts.chim` (+ parser, desugar) | identical Rust at every `--contracts` level, identical diagnostics | ✅ |
 | Native lowering | `selfhost/native.chim` | identical native functions | ✅ |
 | Rust backend | `selfhost/gen_rust.chim` | byte-identical `main.rs` | ✅ |
 | Driver | `selfhost/main.chim` | imports, diagnostics, `check/emit/build/run/tokens` | ✅ |

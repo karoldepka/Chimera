@@ -817,6 +817,14 @@ const $rt = (() => {
       case "mkdirs": try { require("fs").mkdirSync(toStr(a(0)), { recursive: true }); return ok(null); } catch (e) { return err(e.message); }
       case "exit": process.exit(Number(asInt(a(0))));
       case "eprintln": process.stderr.write(toStr(a(0)) + "\n"); return null;
+      case "__check": if (!truthy(a(0))) fail(toStr(a(1))); return null;
+      case "__variant": {
+        const prev = a(0), cur = a(1), what = toStr(a(2));
+        if (!isInt(cur)) fail(`${what} must be an Int, found ${typeName(cur)}`);
+        if (cur < 0n) fail(`${what} must stay non-negative (now ${cur})`);
+        if (isInt(prev) && cur >= prev) fail(`${what} must decrease on every iteration (was ${prev}, now ${cur})`);
+        return cur;
+      }
       case "TRUE": return true;
       case "FALSE": return false;
     }

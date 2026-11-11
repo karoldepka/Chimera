@@ -1075,6 +1075,14 @@ pub fn sheets(name: &str, args: Vec<Value>) -> Value {
         "mkdirs" => match std::fs::create_dir_all(to_str(&a(0))) { Ok(_) => ok(Value::Nil), Err(e) => err(s(&e.to_string())) },
         "exit" => std::process::exit(as_int(&a(0)) as i32),
         "eprintln" => { eprintln!("{}", to_str(&a(0))); Value::Nil }
+        "__check" => { if !truthy(&a(0)) { fail(to_str(&a(1))); } Value::Nil }
+        "__variant" => {
+            let (prev, cur) = (a(0), a(1));
+            let Value::Int(c) = cur else { fail(format!("{} must be an Int, found {}", to_str(&a(2)), type_name(&cur))) };
+            if c < 0 { fail(format!("{} must stay non-negative (now {})", to_str(&a(2)), c)); }
+            if let Value::Int(p) = prev { if c >= p { fail(format!("{} must decrease on every iteration (was {}, now {})", to_str(&a(2)), p, c)); } }
+            cur
+        }
         "TRUE" => Value::Bool(true),
         "FALSE" => Value::Bool(false),
         _ => fail(format!("unknown function {}", name)),

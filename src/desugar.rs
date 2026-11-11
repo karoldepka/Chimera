@@ -9,7 +9,7 @@
 use crate::ast::*;
 use crate::diag::{Diag, Span};
 
-pub fn desugar(p: &mut Program) -> Result<(), Diag> {
+pub fn desugar(p: &mut Program, level: crate::contracts::Level) -> Result<(), Diag> {
     let mut globals = std::collections::HashSet::new();
     for d in &p.decls {
         match d {
@@ -20,7 +20,7 @@ pub fn desugar(p: &mut Program) -> Result<(), Diag> {
             _ => {}
         }
     }
-    let mut d = Desugar { tmp: 0, globals };
+    let mut d = Desugar { tmp: 0, globals, checks: level == crate::contracts::Level::All };
     for decl in &mut p.decls {
         match decl {
             Decl::Fun(f) => d.fun(f)?,
@@ -38,7 +38,7 @@ pub fn desugar(p: &mut Program) -> Result<(), Diag> {
     Ok(())
 }
 
-struct Desugar { tmp: usize, globals: std::collections::HashSet<String> }
+struct Desugar { tmp: usize, globals: std::collections::HashSet<String>, checks: bool }
 
 fn boxed(e: Expr) -> Box<Expr> { Box::new(e) }
 
@@ -131,6 +131,8 @@ impl Desugar {
             }
             ExprKind::Call(callee, args) => match &callee.kind {
                 ExprKind::Ident(n) if is_sheets_lazy(n) => self.sheets_lazy(n.clone(), args, span)?,
+                // `check` / loop contracts are compiled out below `--contracts all`
+                ExprKind::Ident(n) if (n == "__check" || n == "__variant") && !self.checks => ExprKind::Nil,
                 _ => ExprKind::Call(callee, args),
             },
             k => k,

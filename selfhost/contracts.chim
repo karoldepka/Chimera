@@ -1,0 +1,104 @@
+// Design by Contract after semantic analysis (self-hosted). Port of src/contracts.rs:
+// contract inheritance along the MRO (Eiffel / Liskov) and monitoring levels.
+
+fun applyContracts(decls: Vec<Decl>, info: Info, level: String): Vec<Decl> {
+  var orig: Map<String, ClassDecl> = {}
+  for d in decls { match d { DClass(c) => { orig = orig.assoc(c.name, c) }, _ => {} } }
+  var out: Vec<Decl> = []
+  for d in decls {
+    val nd = match d {
+      DClass(c) => {
+        val ci = info.classes[c.name]
+        var ms: Vec<FunDecl> = []
+        for m in c.methods {
+          var m2 = m
+          if ci != nil && m.body != nil { m2 = inheritContracts(m, ci.mro, orig) }
+          ms = ms.push(stripContracts(m2, level))
+        }
+        DClass(c.copy(methods = ms, invariants = if level != "all" { [] } else { c.invariants }))
+      }
+      DFun(f) => DFun(stripContracts(f, level))
+      _ => d
+    }
+    out = out.push(nd)
+  }
+  out
+}
+
+fun stripContracts(f: FunDecl, level: String): FunDecl {
+  if level == "all" { return f }
+  if level == "none" { return f.copy(requires = [], ensures = [], olds = []) }
+  f.copy(ensures = [], olds = [])
+}
+
+fun inheritContracts(m: FunDecl, mro: Vec<String>, orig: Map<String, ClassDecl>): FunDecl {
+  // chain: [[ancestor name, declaration]] in MRO order
+  var chain: Vec<Any> = []
+  for a in mro.drop(1) {
+    val d = (orig[a]?.methods ?: []).find(|x| x.name == m.name)
+    if d != nil { chain = chain.push([a, d]) }
+  }
+  if chain.isEmpty() { return m }
+
+  // ---- preconditions: OR of the blocks
+  var requires = m.requires
+  val triviallyTrue = (!m.isOverride && m.requires.isEmpty()) || chain.any(|c| !c[1].isOverride && c[1].requires.isEmpty())
+  if triviallyTrue {
+    requires = []
+  } else {
+    var blocks: Vec<Any> = []      // [expr, text]
+    if !m.requires.isEmpty() { blocks = blocks.push(conj(m.requires, nil, m)) }
+    for c in chain { if !c[1].requires.isEmpty() { blocks = blocks.push(conj(c[1].requires, c[1], m)) } }
+    val ownOnly = blocks.count() == 1 && !m.requires.isEmpty()
+    if !ownOnly {
+      val span = blocks[0][0].span
+      val text = blocks.map(|b| "(${b[1]})").join(" or ")
+      var e = blocks[0][0]
+      for k in 1..blocks.count() { e = Expr(EBinary("||", e, blocks[k][0]), span) }
+      requires = [Contract(nil, e, text, nil)]
+    }
+  }
+
+  // ---- postconditions: AND of everything, ancestors' after the method's own
+  var olds = m.olds
+  var ensures = m.ensures
+  for c in chain {
+    val d = c[1]
+    val offset = olds.count()
+    for o in d.olds { olds = olds.push(renameParams(o, d, m)) }
+    for e in d.ensures {
+      ensures = ensures.push(Contract(e.tag, renameParams(shiftOlds(e.expr, offset), d, m), e.text, "${c[0]}.${d.name}"))
+    }
+  }
+  m.copy(requires = requires, ensures = ensures, olds = olds)
+}
+
+/// AND of a contract block, renamed to `m`'s parameters when it comes from ancestor `d`
+fun conj(cs: Vec<Contract>, d: FunDecl?, m: FunDecl): Vec<Any> {
+  val span = cs[0]!!.expr.span
+  var e = cs[0]!!.expr
+  for k in 1..cs.count() { e = Expr(EBinary("&&", e, cs[k]!!.expr), span) }
+  if d != nil { e = renameParams(e, d, m) }
+  [e, cs.map(|c| c.text).join(" && ")]
+}
+
+/// `{ val ancestorParam = ownParam; expr }` for parameter names that differ
+fun renameParams(e: Expr, d: FunDecl, m: FunDecl): Expr {
+  var stmts: Vec<Stmt> = []
+  val n = if d.params.count() < m.params.count() { d.params.count() } else { m.params.count() }
+  for k in 0..n {
+    val dp = d.params[k]!!
+    val mp = m.params[k]!!
+    if dp.name != mp.name { stmts = stmts.push(SLet(false, dp.name, nil, Expr(EIdent(mp.name), e.span), e.span)) }
+  }
+  if stmts.isEmpty() { return e }
+  Expr(EBlock(Block(stmts.push(SExpr(e)), e.span)), e.span)
+}
+
+fun shiftOlds(e: Expr, offset: Int): Expr {
+  if offset == 0 { return e }
+  match e.kind {
+    EOld(x, slot) => Expr(EOld(x, slot + offset), e.span)
+    _ => mapChildren(e, |x| shiftOlds(x, offset))
+  }
+}

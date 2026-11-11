@@ -1,0 +1,6 @@
+popped 3, size 2
+gcd(84, 36) = 12, sumTo(100) = 5050
+credit: -30
+plain: 70
+lossy size 1
+Error: postcondition 'grew' violated in LossyStack.push (inherited from Stack.push): size() == old(size()) + 1

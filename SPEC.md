@@ -44,11 +44,19 @@ Every program has a `fun main()`.
 * In a diamond, each ancestor's initializer runs once: the first one in MRO order wins.
 * Concrete classes must implement every abstract member. Abstract classes and traits can't be instantiated.
 
-### Contracts (Eiffel)
+### Design by Contract (Eiffel)
 
 * `require` is checked on entry. `ensure` is checked on exit, and may use `result` and `old(expr)` (the value of `expr` on entry).
-* Clauses may be tagged: `require positive: amount > 0`.
-* `invariant`s are checked after construction and after every *qualified* call (`obj.m()`), but not after calls inside the class (`m()` / `this.m()`), as in Eiffel.
+* Clauses may be tagged: `require positive: amount > 0`. Several clauses can be separated by commas.
+* `invariant`s are checked after construction and after every *qualified* call (`obj.m()`), but not after calls inside the class (`m()` / `this.m()`). Invariants of all ancestors apply.
+* **Contract inheritance.** A method that overrides or implements an inherited method is held to the contracts of every declaration of that method in its class's MRO, including contracts on abstract trait methods:
+  * the effective precondition is the method's own `require else` clauses **or** any ancestor's precondition (an original declaration without `require` accepts everything);
+  * the effective postcondition is the method's own `ensure then` clauses **and** every ancestor's postcondition;
+  * in an override, a plain `require` or `ensure` is a compile error, and `require else` / `ensure then` outside an override is too;
+  * inherited contracts are evaluated with the override's parameter names, and violations name their origin: `… violated in LossyStack.push (inherited from Stack.push)`.
+* **Loops:** `while cond invariant a, b variant e { … }`. The invariants are checked before every evaluation of the condition, so also on exit. The variant must be an `Int` that stays non-negative and strictly decreases on every iteration, which proves termination. `for` loops accept `invariant` only.
+* **`check a, b`** asserts conditions in the middle of a body.
+* **Monitoring levels:** `--contracts all` (default), `pre` (only preconditions), `none`. Contracts below the level are removed at compile time.
 * A violation stops the program with a message that names the clause.
 
 ### Generic functions (CLOS)

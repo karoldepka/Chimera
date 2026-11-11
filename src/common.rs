@@ -107,8 +107,9 @@ pub fn is_formula(e: &Expr) -> bool {
 }
 
 pub fn contract_msg(kind: &str, where_: &str, c: &Contract) -> String {
+    let at = match &c.origin { Some(o) => format!("{} (inherited from {})", where_, o), None => where_.to_string() };
     match &c.tag {
-        Some(t) => format!("{} '{}' violated in {}: {}", kind, t, where_, c.text),
-        None => format!("{} violated in {}: {}", kind, where_, c.text),
+        Some(t) => format!("{} '{}' violated in {}: {}", kind, t, at, c.text),
+        None => format!("{} violated in {}: {}", kind, at, c.text),
     }
 }

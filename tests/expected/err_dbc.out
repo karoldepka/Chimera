@@ -1,0 +1,10 @@
+tests/errors/dbc.chim:13:1: error: `require else` is only allowed when overriding, and 'plain' overrides nothing
+   13 | fun plain(x: Int): Int
+      | ^^^^^^^^^^^^^^^^^^^^^^
+tests/errors/dbc.chim:8:12: error: 'withdraw' overrides an inherited method, so it may only weaken the precondition: write `require else`
+    8 |   override fun withdraw(amount: Int): Int
+      |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/errors/dbc.chim:8:12: error: 'withdraw' overrides an inherited method, so it may only strengthen the postcondition: write `ensure then`
+    8 |   override fun withdraw(amount: Int): Int
+      |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+3 errors found

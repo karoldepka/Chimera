@@ -18,6 +18,7 @@ import "desugar.chim"
 import "sema.chim"
 import "common.chim"
 import "native.chim"
+import "contracts.chim"
 import "gen_rust.chim"
 
 fun runtimeSource(): String = embedFile("../runtime/rt.rs")
@@ -105,7 +106,7 @@ fun failWith(ds: Vec<Diag>, segs: Vec<Segment>) {
 // ---------------------------------------------------------------- pipeline
 data class Compiled(val decls: Vec<Decl>, val info: Info, val baseDir: String)
 
-fun compile(file: String): Compiled {
+fun compile(file: String, level: String): Compiled {
   val loader = Loader()
   match loader.load(file) {
     Err(e) => { eprintln("error: $e"); exit(1) }
@@ -116,15 +117,15 @@ fun compile(file: String): Compiled {
     Ok(ds) => ds
     Err(d) => { failWith([d], loader.segs); [] }
   }
-  val desugared = match desugarProgram(parsed) {
+  val desugared = match desugarProgram(parsed, level) {
     Ok(ds) => ds
     Err(d) => { failWith([d], loader.segs); [] }
   }
-  val info = match check(desugared) {
+  val info = match checkProgram(desugared) {
     Ok(i) => i
     Err(ds) => { failWith(ds, loader.segs); Info() }
   }
-  Compiled(desugared, info, dirname(file))
+  Compiled(applyContracts(desugared, info, level), info, dirname(file))
 }
 
 fun crateName(stem: String): String {
@@ -159,7 +160,7 @@ fun buildRust(c: Compiled, out: String, stem: String): String {
 }
 
 fun usage() {
-  eprintln("Chimera compiler (self-hosted)\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> [-o <dir>]\n  chimera run   <file.chim> [-o <dir>] [-- args...]\n  chimera emit  <file.chim>\n  chimera tokens <file.chim>")
+  eprintln("Chimera compiler (self-hosted)\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> [-o <dir>]\n  chimera run   <file.chim> [-o <dir>] [-- args...]\n\n  --contracts all|pre|none   contract monitoring level (default: all)\n  chimera emit  <file.chim>\n  chimera tokens <file.chim>")
   exit(2)
 }
 
@@ -170,12 +171,19 @@ fun main() {
   val file = argv[1]!!
   var out: String? = nil
   var rest: Vec<String> = []
+  var level = "all"
   var k = 2
   while k < argv.count() {
     val a = argv[k]!!
     if a == "-o" { out = argv[k + 1]; k += 2 }
     else if a == "--target" || a == "-t" {
       if argv[k + 1] != "rust" { eprintln("error: the self-hosted compiler only has the Rust backend"); exit(2) }
+      k += 2
+    }
+    else if a == "--contracts" {
+      val l = argv[k + 1] ?: ""
+      level = if l == "all" { "all" } else if l == "pre" || l == "require" { "pre" } else if l == "none" || l == "off" { "none" } else { "" }
+      if level == "" { eprintln("error: --contracts takes all, pre or none"); exit(2) }
       k += 2
     }
     else if a == "--" { rest = argv.drop(k + 1); k = argv.count() }
@@ -189,7 +197,7 @@ fun main() {
     }
     return nil
   }
-  val c = compile(file)
+  val c = compile(file, level)
   if cmd == "check" { println("$file: ok"); return nil }
   if cmd == "emit" { print(generateRust(c.decls, c.info, c.baseDir)); return nil }
   if cmd == "build" || cmd == "run" {
