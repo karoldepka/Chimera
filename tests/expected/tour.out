@@ -1,0 +1,27 @@
+== records & utility types
+{"name": "Ada", "plan": "business"}, Bob's email domain: none
+== exact decimals & units
+green: 0.6234 PLN/kWh; 0.1 + 0.2 == 0.3 is true
+heater: 7.5 kW·h per evening, 225.0 kWh a month
+usage: Ok(316.75 kWh), Err("bad reading '12x'")
+== contracts, traits, enums
+Metered(316.75 kWh) -> net 197.461950 PLN, gross 242.88 PLN
+  [audit acct#1] charged 242.88 PLN, balance -242.88 PLN
+Estimated(300 kWh, "no access") -> net 168.31800 PLN, gross 207.03 PLN
+  [audit acct#1] charged 207.03 PLN, balance -449.91 PLN
+Missing -> net 0 PLN, gross 0.00 PLN
+== multimethods
+send 'bill ready' to Ada
+no email for Bob
+log only: Ada
+== Clojure collections & threading, ordinals
+1st: Cy
+2nd: Ada
+3rd: Bob
+total 926 kWh, top half: Cy & Ada
+== a live spreadsheet
+gross 242.88 ⚠ high (net, VAT)
+after correction: gross 115.02 ok (net, VAT)
+== invariants
+  [audit acct#1] charged 400 PLN, balance -849.91 PLN
+Error: invariant violation in Account (class Account): notTooNegative: balance > -500 PLN

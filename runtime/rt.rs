@@ -82,8 +82,12 @@ pub fn init() {
 }
 
 pub fn run(main: fn() -> Value) {
-    init();
-    if std::panic::catch_unwind(|| { main(); }).is_err() { std::process::exit(1); }
+    // run on a thread with a large stack: Chimera programs (e.g. the self-hosted compiler) recurse deeply
+    let t = std::thread::Builder::new().stack_size(1 << 30).spawn(move || {
+        init();
+        std::panic::catch_unwind(|| { main(); }).is_ok()
+    }).unwrap();
+    if !t.join().unwrap_or(false) { std::process::exit(1); }
 }
 
 // ============================================================ classes & dispatch
@@ -467,6 +471,7 @@ pub fn to_str(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Float(f) => fmt_float(*f),
         Value::Dec(d) => d.show(),
+        Value::Qty(q) if is_ord(v) => { let n = as_int(&q.amt); format!("{}{}", n, ordinal_suffix(n)) }
         Value::Qty(q) => format!("{} {}", to_str(&q.amt), unit_show(&q.unit)),
         Value::Str(s) => s.to_string(),
         Value::Vec(items) => format!("[{}]", items.iter().map(repr).collect::<Vec<_>>().join(", ")),
@@ -673,7 +678,27 @@ fn num_op(a: &Value, b: &Value, op: &str, fi: fn(i64, i64) -> Option<i64>, fd: f
     }
 }
 fn plain_num(v: &Value) -> bool { matches!(v, Value::Int(_) | Value::Dec(_) | Value::Float(_)) }
+fn is_ord(v: &Value) -> bool { matches!(v, Value::Qty(q) if q.unit.len() == 1 && q.unit[0].0 == "ord") }
+pub fn ordinal_suffix(n: i64) -> &'static str {
+    let n = n.abs();
+    if (11..=13).contains(&(n % 100)) { return "th"; }
+    match n % 10 { 1 => "st", 2 => "nd", 3 => "rd", _ => "th" }
+}
+/// ordinals (positions) form an affine space over cardinals (counts)
+fn ord_op(a: &Value, b: &Value, op: &str) -> Option<Value> {
+    if !is_ord(a) && !is_ord(b) { return None; }
+    let amt = |v: &Value| if let Value::Qty(q) = v { q.amt.clone() } else { v.clone() };
+    Some(match (op, is_ord(a), is_ord(b)) {
+        ("+", true, false) | ("-", true, false) if matches!(b, Value::Int(_)) => mk_qty(arith(&amt(a), b, op), vec![("ord".into(), 1)]),
+        ("+", false, true) if matches!(a, Value::Int(_)) => mk_qty(add(a, &amt(b)), vec![("ord".into(), 1)]),
+        ("-", true, true) => sub(&amt(a), &amt(b)),
+        ("+", true, true) => fail("cannot add two ordinals (positions)"),
+        ("+" | "-", _, _) => fail(format!("ordinals only move by whole cardinal numbers, not by {}", type_name(if is_ord(a) { b } else { a }))),
+        _ => fail(format!("operator '{}' is not defined for ordinals", op)),
+    })
+}
 fn qty_op(a: &Value, b: &Value, op: &str) -> Option<Value> {
+    if let Some(r) = ord_op(a, b, op) { return Some(r); }
     let verb = match op { "-" => "subtract", "*" => "multiply", "/" => "divide", _ => "add" };
     match (a, b) {
         (Value::Qty(x), Value::Qty(y)) => Some(match op {
@@ -814,7 +839,8 @@ pub fn builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Value {
             _ => no_method(recv, name),
         },
         Value::Qty(q) => match name {
-            "amount" => q.amt.clone(),
+            "amount" | "cardinal" => q.amt.clone(),
+            "index" if is_ord(recv) => sub(&q.amt, &Value::Int(1)), // zero-based index of a position
             "unit" => s(&unit_show(&q.unit)),
             "to" => convert_to(recv, &to_str(&a0())),
             "abs" => mk_qty(builtin_method(&q.amt, "abs", vec![]), q.unit.clone()),
@@ -823,6 +849,7 @@ pub fn builtin_method(recv: &Value, name: &str, args: Vec<Value>) -> Value {
         },
         Value::Int(_) | Value::Float(_) | Value::Dec(_) => match name {
             "withUnit" => qty(recv.clone(), &to_str(&a0())),
+            "ordinal" => qty(Value::Int(as_int(recv)), "ord"),
             "toDecimal" => Value::Dec(to_dec(recv)),
             "toFloat" => Value::Float(as_f64(recv)),
             "toInt" => Value::Int(as_f64(recv).trunc() as i64),
@@ -1040,6 +1067,11 @@ pub fn sheets(name: &str, args: Vec<Value>) -> Value {
         "readFile" => match std::fs::read_to_string(to_str(&a(0))) { Ok(t) => ok(s(&t)), Err(e) => err(s(&e.to_string())) },
         "writeFile" => match std::fs::write(to_str(&a(0)), to_str(&a(1))) { Ok(_) => ok(Value::Nil), Err(e) => err(s(&e.to_string())) },
         "args" => vec(std::env::args().skip(1).map(|x| s(&x)).collect()),
+        "exec" => {
+            let argv: Vec<String> = iter(&a(1)).iter().map(to_str).collect();
+            match std::process::Command::new(to_str(&a(0))).args(argv).status() { Ok(st) => Value::Int(st.code().unwrap_or(1) as i64), Err(_) => Value::Int(127) }
+        }
+        "mkdirs" => match std::fs::create_dir_all(to_str(&a(0))) { Ok(_) => ok(Value::Nil), Err(e) => err(s(&e.to_string())) },
         "exit" => std::process::exit(as_int(&a(0)) as i32),
         "eprintln" => { eprintln!("{}", to_str(&a(0))); Value::Nil }
         "TRUE" => Value::Bool(true),

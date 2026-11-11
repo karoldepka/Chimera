@@ -11,6 +11,12 @@ pub fn is_cell(s: &str) -> bool {
     letters >= 1 && letters <= 3 && s.len() > letters && s[letters..].chars().all(|c| c.is_ascii_digit())
 }
 
+pub fn ordinal_suffix(n: i64) -> &'static str {
+    let n = n.abs();
+    if (11..=13).contains(&(n % 100)) { return "th"; }
+    match n % 10 { 1 => "st", 2 => "nd", 3 => "rd", _ => "th" }
+}
+
 pub fn parse(src: &str) -> PResult<Program> {
     let mut p = Parser { t: lex(src, 0)?, i: 0, src, in_sheet: false };
     let mut decls = Vec::new();
@@ -609,10 +615,10 @@ impl<'a> Parser<'a> {
                 self.bump();
                 let n = v.parse::<i64>().map_err(|_| Diag::new("integer literal out of range", st))?;
                 let e = Expr::new(ExprKind::Int(n), st);
-                return Ok(self.unit_suffix(e));
+                return self.unit_suffix(e);
             }
-            Tk::Float(v) => { self.bump(); let e = Expr::new(ExprKind::Float(v.parse().unwrap()), st); return Ok(self.unit_suffix(e)); }
-            Tk::Decimal(v) => { self.bump(); let e = Expr::new(ExprKind::Decimal(v.clone()), st); return Ok(self.unit_suffix(e)); }
+            Tk::Float(v) => { self.bump(); let e = Expr::new(ExprKind::Float(v.parse().unwrap()), st); return self.unit_suffix(e); }
+            Tk::Decimal(v) => { self.bump(); let e = Expr::new(ExprKind::Decimal(v.clone()), st); return self.unit_suffix(e); }
             Tk::Str(parts) => {
                 self.bump();
                 let mut segs = vec![];
@@ -695,16 +701,24 @@ impl<'a> Parser<'a> {
     }
 
     /// A unit name directly after a number literal on the same line: `100 USD`, `2.5 kW`, `30 min`.
-    fn unit_suffix(&mut self, e: Expr) -> Expr {
+    fn unit_suffix(&mut self, e: Expr) -> PResult<Expr> {
         if let Tk::Ident(u) = &self.cur().tk {
             if !self.cur().nl_before && !(self.in_sheet && is_cell(u)) {
                 let u = u.clone();
                 let span = e.span.to(self.here());
+                let adjacent = self.cur().span.start == e.span.end;
                 self.bump();
-                return Expr::new(ExprKind::Quantity(Box::new(e), u), span);
+                // ordinals: `1st`, `2nd`, `3rd`, `4th` (written without a space) are positions, unit `ord`
+                if adjacent && matches!(u.as_str(), "st" | "nd" | "rd" | "th") {
+                    let ExprKind::Int(n) = e.kind else { return Err(Diag::new("ordinal suffixes need an integer, e.g. 3rd", span)) };
+                    let want = ordinal_suffix(n);
+                    if want != u { return Err(Diag::new(format!("ordinal {} is written {}{}", n, n, want), span)); }
+                    return Ok(Expr::new(ExprKind::Quantity(Box::new(e), "ord".into()), span));
+                }
+                return Ok(Expr::new(ExprKind::Quantity(Box::new(e), u), span));
             }
         }
-        e
+        Ok(e)
     }
 
     fn brace_literal(&mut self) -> PResult<Expr> {

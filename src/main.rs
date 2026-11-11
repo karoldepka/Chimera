@@ -20,6 +20,14 @@ mod units;
 use std::path::{Path, PathBuf};
 use std::process::{exit, Command};
 
+thread_local! { pub static BASE_DIR: std::cell::RefCell<PathBuf> = std::cell::RefCell::new(PathBuf::from(".")); }
+
+/// `embedFile("path")`: read a file at compile time, relative to the main source file.
+pub fn embed_file(rel: &str) -> String {
+    let p = BASE_DIR.with(|b| b.borrow().join(rel));
+    std::fs::read_to_string(&p).unwrap_or_else(|e| { eprintln!("error: embedFile: cannot read {}: {}", p.display(), e); exit(1) })
+}
+
 const RT_RS: &str = include_str!("../runtime/rt.rs");
 const RT_JS: &str = include_str!("../runtime/rt.js");
 
@@ -28,16 +36,51 @@ fn usage() -> ! {
     exit(2)
 }
 
+/// A source file spliced into the combined program text by `import "file.chim"`.
+pub struct Segment { pub start: usize, pub end: usize, pub file: String, pub text: String, pub base: usize }
+
+/// Resolve `import "path"` lines (relative to the importing file) by textual inclusion, each file once.
+/// Imported files come first; import lines are blanked so offsets inside each file are preserved.
+fn load(path: &Path, seen: &mut Vec<PathBuf>, out: &mut String, segs: &mut Vec<Segment>) {
+    let canon = path.canonicalize().unwrap_or(path.to_path_buf());
+    if seen.contains(&canon) { return; }
+    seen.push(canon);
+    let text = std::fs::read_to_string(path).unwrap_or_else(|e| { eprintln!("error: cannot read {}: {}", path.display(), e); exit(1) });
+    let mut body = String::new();
+    for line in text.split_inclusive('\n') {
+        let t = line.trim();
+        if t.starts_with("import \"") && t.ends_with('"') {
+            let rel = &t[8..t.len() - 1];
+            let dir = path.parent().unwrap_or(Path::new("."));
+            load(&dir.join(rel), seen, out, segs);
+            body.push_str(&" ".repeat(line.trim_end_matches('\n').len()));
+            if line.ends_with('\n') { body.push('\n'); }
+        } else { body.push_str(line); }
+    }
+    let start = out.len();
+    out.push_str(&body);
+    out.push('\n');
+    segs.push(Segment { start, end: out.len(), file: path.display().to_string(), text: body, base: start });
+}
+
 fn compile(file: &str) -> (ast::Program, sema::Info) {
-    let src = std::fs::read_to_string(file).unwrap_or_else(|e| { eprintln!("error: cannot read {}: {}", file, e); exit(1) });
+    let mut src = String::new();
+    let mut segs = vec![];
+    load(Path::new(file), &mut vec![], &mut src, &mut segs);
     let fail = |d: Vec<diag::Diag>| -> ! {
-        for x in &d { eprint!("{}", x.render(file, &src)); }
+        for x in &d {
+            let seg = segs.iter().find(|g| x.span.start >= g.start && x.span.start < g.end).or(segs.last()).unwrap();
+            let local = diag::Diag::new(x.msg.clone(), diag::Span::new(x.span.start - seg.base, x.span.end.saturating_sub(seg.base)));
+            eprint!("{}", local.render(&seg.file, &seg.text));
+        }
         eprintln!("{} error{} found", d.len(), if d.len() == 1 { "" } else { "s" });
         exit(1)
     };
     let mut prog = parser::parse(&src).unwrap_or_else(|d| fail(vec![d]));
     desugar::desugar(&mut prog).unwrap_or_else(|d| fail(vec![d]));
     let info = sema::check(&mut prog).unwrap_or_else(|d| fail(d));
+    let dir = Path::new(file).parent().map(|p| p.to_path_buf()).unwrap_or(PathBuf::from("."));
+    BASE_DIR.with(|b| *b.borrow_mut() = dir);
     (prog, info)
 }
 

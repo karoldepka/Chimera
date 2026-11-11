@@ -1,0 +1,112 @@
+// Chimera AST (self-hosted). Mirrors src/ast.rs.
+
+data class Span(val start: Int, val end: Int)
+
+data class Diag(val msg: String, val span: Span)
+
+enum TypeNode {
+  TName(name: String, args: Vec<TypeNode>, span: Span),
+  TNullable(inner: TypeNode),
+  TRecord(fields: Vec<RecordField>),
+  TStrLit(value: String),
+  TUnion(options: Vec<TypeNode>),
+  TFn(params: Vec<TypeNode>, ret: TypeNode),
+  TKeyOf(inner: TypeNode)
+}
+
+data class RecordField(val name: String, val ty: TypeNode, val optional: Bool, val readonly: Bool)
+
+enum Pattern {
+  PWild,
+  PBind(name: String),
+  PLit(e: Expr),
+  PVariant(name: String, args: Vec<Pattern>, span: Span)
+}
+
+data class Arg(val name: String?, val value: Expr)
+
+enum MapEntry { MSpread(x: Expr), MKv(k: Expr, v: Expr) }
+
+enum StrSeg { SegLit(s: String), SegExpr(e: Expr) }
+
+data class Expr(val kind: ExprKind, val span: Span)
+
+enum ExprKind {
+  EInt(v: Int),
+  EFloat(v: Float),
+  EDecimal(text: String),
+  EQuantity(x: Expr, unit: String),
+  EStr(segs: Vec<StrSeg>),
+  EBool(v: Bool),
+  ENil,
+  EIdent(name: String),
+  EThis,
+  EResult,
+  EOld(x: Expr, slot: Int),
+  EBinary(op: String, l: Expr, r: Expr),
+  EUnary(op: String, x: Expr),
+  EPercent(x: Expr),
+  ECall(callee: Expr, args: Vec<Arg>),
+  EMember(obj: Expr, name: String, safe: Bool),
+  ESuper(qualifier: String?, name: String, args: Vec<Arg>),
+  EIndex(obj: Expr, index: Expr),
+  ELambda(params: Vec<Param>, body: Expr),
+  EIf(cond: Expr, then: Block, els: Block?),
+  EMatch(subject: Expr, arms: Vec<MatchArm>),
+  EVec(items: Vec<Expr>),
+  EMap(entries: Vec<MapEntry>),
+  ETry(x: Expr),
+  ENotNull(x: Expr),
+  EThread(op: String, left: Expr, right: Expr),
+  ERange(from: Expr, to: Expr),
+  EBlock(b: Block),
+  EIs(x: Expr, ty: TypeNode),
+  ESheet(cells: Vec<SheetCell>),
+  ECellRef(cell: String),
+  ECellRange(from: String, to: String)
+}
+
+data class SheetCell(val cell: String, val value: Expr, val span: Span)
+data class MatchArm(val pat: Pattern, val guard: Expr?, val body: Expr, val span: Span)
+
+enum Stmt {
+  SLet(mutable: Bool, name: String, ty: TypeNode?, init: Expr, span: Span),
+  SAssign(target: Expr, op: String, value: Expr, span: Span),
+  SExpr(e: Expr),
+  SReturn(value: Expr?, span: Span),
+  SWhile(cond: Expr, body: Block),
+  SFor(name: String, iter: Expr, body: Block),
+  SBreak(span: Span),
+  SContinue(span: Span)
+}
+
+data class Block(val stmts: Vec<Stmt>, val span: Span)
+
+// `field` is "val", "var" or nil (class constructor parameters only)
+data class Param(val name: String, val ty: TypeNode?, val dflt: Expr?, val field: String?, val span: Span)
+data class Contract(val tag: String?, val expr: Expr, val text: String)
+
+data class FunDecl(val name: String, val params: Vec<Param>, val ret: TypeNode?, val requires: Vec<Contract>,
+                   val ensures: Vec<Contract>, val body: Expr?, val isOverride: Bool, val span: Span, val olds: Vec<Expr>)
+data class FieldDecl(val mutable: Bool, val name: String, val ty: TypeNode?, val init: Expr, val span: Span)
+data class SuperRef(val name: String, val args: Vec<Arg>?, val span: Span)
+data class ClassDecl(val name: String, val isTrait: Bool, val isData: Bool, val isAbstract: Bool, val params: Vec<Param>,
+                     val supers: Vec<SuperRef>, val methods: Vec<FunDecl>, val fields: Vec<FieldDecl>,
+                     val invariants: Vec<Contract>, val span: Span)
+data class VariantDecl(val name: String, val fields: Vec<Param>, val span: Span)
+data class EnumDecl(val name: String, val variants: Vec<VariantDecl>, val span: Span)
+data class TypeAliasDecl(val name: String, val typeParams: Vec<String>, val ty: TypeNode, val span: Span)
+data class GenericDecl(val name: String, val params: Vec<Param>, val span: Span)
+data class MethodDecl(val qualifier: String, val name: String, val params: Vec<Param>, val body: Expr, val span: Span)
+
+enum Decl {
+  DFun(f: FunDecl),
+  DClass(c: ClassDecl),
+  DEnum(e: EnumDecl),
+  DTypeAlias(t: TypeAliasDecl),
+  DGeneric(g: GenericDecl),
+  DMethod(m: MethodDecl)
+}
+
+fun mkExpr(kind: ExprKind, span: Span): Expr = Expr(kind, span)
+fun spanTo(a: Span, b: Span): Span = Span(a.start, if b.end > a.end { b.end } else { a.end })

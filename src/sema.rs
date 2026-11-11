@@ -144,7 +144,7 @@ pub const BUILTINS: &[&str] = &[
     "SPLIT", "SUBSTITUTE", "SUMIF", "COUNTIF", "AVERAGEIF", "FILTER", "SORT", "UNIQUE", "SEQUENCE", "VLOOKUP", "INDEX",
     "MATCH", "ISBLANK", "ISNUMBER", "ISTEXT", "ISERROR", "MAP", "REDUCE", "TRUE", "FALSE", "UNIT", "CONVERT",
     // system (needed for self-hosting)
-    "readFile", "writeFile", "args", "exit", "eprintln",
+    "readFile", "writeFile", "args", "exit", "eprintln", "exec", "mkdirs", "embedFile",
 ];
 
 pub fn is_builtin(n: &str) -> bool { BUILTINS.contains(&n) }
@@ -942,6 +942,18 @@ impl Checker {
             "+" if matches!(lt, Ty::Str) || matches!(rt, Ty::Str) => Ty::Str,
             "+" | "-" | "*" | "/" | "%" | "^" if matches!(lt, Ty::Qty(_)) || matches!(rt, Ty::Qty(_)) => {
                 let plain = |t: &Ty| matches!(t, Ty::Int | Ty::Float | Ty::Decimal);
+                let is_ord = |t: &Ty| matches!(t, Ty::Qty(u) if u.len() == 1 && u[0].0 == "ord");
+                // ordinals form an affine space over cardinals: position ± count = position, position − position = count
+                if is_ord(&lt) || is_ord(&rt) {
+                    return match (op, is_ord(&lt), is_ord(&rt)) {
+                        ("+", true, false) | ("-", true, false) if matches!(rt, Ty::Int | Ty::Any) => lt.clone(),
+                        ("+", false, true) if matches!(lt, Ty::Int | Ty::Any) => rt.clone(),
+                        ("-", true, true) => Ty::Int,
+                        ("+", true, true) => { self.err("cannot add two ordinals (positions); subtract them to get a count, or add a count to a position", l.span.to(r.span)); Ty::Any }
+                        ("+" | "-", _, _) => { self.err(format!("ordinals only move by whole cardinal numbers (Int), not by {}", if is_ord(&lt) { rt.show() } else { lt.show() }), l.span.to(r.span)); Ty::Any }
+                        _ => { self.err(format!("operator '{}' is not defined for ordinals (positions); use a cardinal number", op), l.span.to(r.span)); Ty::Any }
+                    };
+                }
                 match (op, &lt, &rt) {
                     ("+" | "-" | "%", Ty::Qty(a), Ty::Qty(b)) => {
                         if !units::compatible(a, b) { self.err(format!("cannot {} {} and {}: incompatible units", if op == "-" { "subtract" } else { "add" }, units::show(a), units::show(b)), r.span); }
@@ -1056,6 +1068,8 @@ impl Checker {
                         "ISBLANK" | "ISNUMBER" | "ISTEXT" | "ISERROR" | "TRUE" | "FALSE" => Ty::Bool,
                         "println" | "print" | "eprintln" | "writeFile" | "exit" => Ty::Unit,
                         "readFile" => Ty::Enum("Result".into()),
+                        "embedFile" => Ty::Str,
+                        "exec" => Ty::Int,
                         "args" => Ty::Vec(Box::new(Ty::Str)),
                         "atom" => Ty::Atom,
                         "range" | "SEQUENCE" => Ty::Vec(Box::new(Ty::Int)),

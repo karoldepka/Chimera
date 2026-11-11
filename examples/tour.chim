@@ -1,0 +1,125 @@
+// A tour of Chimera: a tiny energy-billing system.
+
+// ---- TypeScript-style records + utility types --------------------------------
+struct Customer {
+  id: Int,
+  name: String,
+  email: String?,
+  plan: "basic" | "green" | "business"
+}
+type CustomerUpdate = Partial<Omit<Customer, "id">>
+type Badge = Readonly<Pick<Customer, "name" | "plan">>
+
+// ---- Rust-style enums + exhaustive match --------------------------------------
+enum Reading {
+  Metered(kwh: Quantity<kWh>),
+  Estimated(kwh: Quantity<kWh>, reason: String),
+  Missing
+}
+
+// ---- traits + multiple inheritance + Eiffel contracts -------------------------
+trait Priced {
+  abstract fun price(): Quantity<PLN>
+  fun withVat(): Quantity<PLN> = ROUND(price() * 1.23, 2)
+}
+
+trait Audited {
+  fun audit(msg: String) { println("  [audit ${tag()}] $msg") }
+  fun tag(): String = "?"
+}
+
+open class Account(val customer: Customer, var balance: Quantity<PLN> = 0 PLN) : Audited {
+  invariant notTooNegative: balance > -500 PLN
+
+  fun charge(amount: Quantity<PLN>)
+    require positive: amount > 0 PLN
+    ensure balance == old(balance) - amount
+  {
+    balance = balance - amount
+    audit("charged $amount, balance $balance")
+  }
+  override fun tag(): String = "acct#${customer.id}"
+}
+
+class Invoice(val account: Account, val reading: Reading, val rate: Quantity<PLN>) : Priced, Audited {
+  override fun price(): Quantity<PLN> = match reading {
+    Metered(kwh) => kwh.amount * rate
+    Estimated(kwh, _) => kwh.amount * rate * 0.9      // 10% discount on estimates
+    Missing => 0 PLN
+  }
+  override fun tag(): String = "invoice"
+}
+
+// ---- CLOS multimethods: dispatch on BOTH arguments ----------------------------
+generic notify(channel, who)
+method notify(channel: String, who: Account) = "send '${channel}' to ${who.customer.name}"
+method notify(channel: Any, who: Account) = "log only: ${who.customer.name}"
+around notify(channel: String, who: Account) = if who.customer.email == nil { "no email for ${who.customer.name}" } else { callNext() }
+
+// ---- Kotlin data classes, null safety, Result + `?` ---------------------------
+data class Tariff(val name: String, val rate: Quantity<PLN>)
+
+fun parseKwh(s: String): Result<Quantity<kWh>, String> {
+  val n = s.toDecimal() ?: return Err("bad reading '$s'")
+  if n < 0 { return Err("negative reading $n") }
+  Ok(n.withUnit("kWh"))
+}
+
+fun usage(prev: String, cur: String): Result<Quantity<kWh>, String> = Ok(parseKwh(cur)? - parseKwh(prev)?)
+
+fun main() {
+  println("== records & utility types")
+  var ada: Customer = {id: 1, name: "Ada", email: "ada@grid.pl", plan: "green"}
+  val bob: Customer = {id: 2, name: "Bob", email: nil, plan: "basic"}
+  val change: CustomerUpdate = {plan: "business"}
+  ada = {...ada, ...change}
+  val badge: Badge = {name: ada.name, plan: ada.plan}
+  println("$badge, Bob's email domain: ${bob.email?.split("@")?.last() ?: "none"}")
+
+  println("== exact decimals & units")
+  val green = Tariff("green", 0.6234 PLN)
+  println("${green.name}: ${green.rate}/kWh; 0.1 + 0.2 == 0.3 is ${0.1 + 0.2 == 0.3}")
+  println("heater: ${2.5 kW * 3 h} per evening, ${(2.5 kW * 3 h * 30).amount} kWh a month")
+  println("usage: ${usage("1200.5", "1517.25")}, ${usage("12x", "40")}")
+
+  println("== contracts, traits, enums")
+  val acct = Account(ada)
+  val readings = [Metered(316.75 kWh), Estimated(300 kWh, "no access"), Missing]
+  for r in readings {
+    val inv = Invoice(acct, r, green.rate)
+    println("$r -> net ${inv.price()}, gross ${inv.withVat()}")
+    if inv.price() > 0 PLN { acct.charge(inv.withVat()) }
+  }
+
+  println("== multimethods")
+  println(notify("bill ready", acct))
+  println(notify("bill ready", Account(bob)))
+  println(notify(42, acct))
+
+  println("== Clojure collections & threading, ordinals")
+  val ranking = [{name: "Ada", kwh: 316}, {name: "Bob", kwh: 98}, {name: "Cy", kwh: 512}]
+    -> sortBy(|c| -c.kwh)
+  for i in 0..ranking.count() {
+    val place = 1st + i
+    println("$place: ${ranking[i]?.name}")
+  }
+  val total = atom(0)
+  ranking.each(|c| total.swap(|t| t + c.kwh))
+  println("total ${@total} kWh, top half: ${ranking -> take(2) -> map(|c| c.name) -> join(" & ")}")
+
+  println("== a live spreadsheet")
+  val bill = sheet {
+    A1 = "kWh";     B1 = 316.75
+    A2 = "rate";    B2 = 0.6234
+    A3 = "net";     B3 = ROUND(B1 * B2, 2)
+    A4 = "VAT";     B4 = ROUND(B3 * 23%, 2)
+    A5 = "gross";   B5 = B3 + B4
+    C5 = IF(B5 > 200, "⚠ high", "ok") & " (" & TEXTJOIN(", ", true, A3:A4) & ")"
+  }
+  println("gross ${bill.B5} ${bill.C5}")
+  bill.B1 = 150
+  println("after correction: gross ${bill.B5} ${bill.C5}")
+
+  println("== invariants")
+  acct.charge(400 PLN)
+}

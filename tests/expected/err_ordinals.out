@@ -1,0 +1,10 @@
+tests/errors/ordinals.chim:2:11: error: cannot add two ordinals (positions); subtract them to get a count, or add a count to a position
+    2 |   val a = 1st + 3rd
+      |           ^^^^^^^^^
+tests/errors/ordinals.chim:3:11: error: operator '*' is not defined for ordinals (positions); use a cardinal number
+    3 |   val b = 2nd * 3
+      |           ^^^^^^^
+tests/errors/ordinals.chim:4:11: error: ordinals only move by whole cardinal numbers (Int), not by Decimal
+    4 |   val c = 3rd + 1.5
+      |           ^^^^^^^^^
+3 errors found

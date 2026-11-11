@@ -215,7 +215,6 @@ impl<'a> Gen<'a> {
                 format!("let mut {}: Value = {};", rid(name), v)
             }
             Stmt::Assign { target, value, .. } => {
-                let v = self.expr(value);
                 // in-place fast paths for `xs = xs.push(v)` / `m = m.assoc(k, v)` (copy-on-write via Rc::make_mut)
                 if let (ExprKind::Ident(n), ExprKind::Call(c, args)) = (&target.kind, &value.kind) {
                     if let ExprKind::Member { obj, name, safe: false } = &c.kind {
@@ -237,6 +236,7 @@ impl<'a> Gen<'a> {
                         let x = self.rf(r); return format!("rt::str_append(&mut {}, {});", rid(n), x);
                     }
                 }
+                let v = self.expr(value);
                 match &target.kind {
                     ExprKind::Ident(n) if self.is_local(n) => format!("{} = {};", rid(n), v),
                     ExprKind::Ident(n) => format!("rt::set(&this, {}, {});", lit(n), v),
@@ -354,6 +354,11 @@ impl<'a> Gen<'a> {
     fn call(&mut self, callee: &Expr, args: &[Arg]) -> String {
         match &callee.kind {
             ExprKind::Ident(n) if !self.is_local(n) && !self.field(n) => {
+                if n == "embedFile" {
+                    if let [Arg { value: Expr { kind: ExprKind::Str(segs), .. }, .. }] = args {
+                        if let [StrSeg::Lit(path)] = segs.as_slice() { return format!("rt::s({})", lit(&crate::embed_file(path))); }
+                    }
+                }
                 if n == "callNext" {
                     return if args.is_empty() { "__next(__args.clone())".into() } else { format!("__next({})", self.args_vec(args)) };
                 }

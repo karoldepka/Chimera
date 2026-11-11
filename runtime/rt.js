@@ -397,6 +397,7 @@ const $rt = (() => {
     if (isInt(v)) return v.toString();
     if (isFloat(v)) return fmtFloat(v);
     if (v instanceof Dec) return decShow(v);
+    if (isOrd(v)) { const n = asInt(v.amt); return `${n}${ordinalSuffix(n)}`; }
     if (v instanceof Qty) return `${toStr(v.amt)} ${unitShow(v.unit)}`;
     if (typeof v === "string") return v;
     if (Array.isArray(v)) return `[${v.map(repr).join(", ")}]`;
@@ -451,7 +452,25 @@ const $rt = (() => {
     }
     fail(`operator '${op}' cannot be applied to ${typeName(a)} and ${typeName(b)}`);
   }
+  const isOrd = (v) => v instanceof Qty && v.unit.length === 1 && v.unit[0][0] === "ord";
+  function ordinalSuffix(n) {
+    n = n < 0n ? -n : n;
+    if (n % 100n >= 11n && n % 100n <= 13n) return "th";
+    return { 1n: "st", 2n: "nd", 3n: "rd" }[n % 10n] ?? "th";
+  }
+  function ordOp(a, b, op) {
+    if (!isOrd(a) && !isOrd(b)) return undefined;
+    const amt = (v) => v instanceof Qty ? v.amt : v;
+    const oa = isOrd(a), ob = isOrd(b);
+    if ((op === "+" || op === "-") && oa && !ob && isInt(b)) return mkQty(arith(amt(a), b, op), [["ord", 1]]);
+    if (op === "+" && !oa && ob && isInt(a)) return mkQty(add(a, amt(b)), [["ord", 1]]);
+    if (op === "-" && oa && ob) return sub(amt(a), amt(b));
+    if (op === "+" && oa && ob) fail("cannot add two ordinals (positions)");
+    if (op === "+" || op === "-") fail(`ordinals only move by whole cardinal numbers, not by ${typeName(oa ? b : a)}`);
+    fail(`operator '${op}' is not defined for ordinals`);
+  }
   function qtyOp(a, b, op) {
+    const o = ordOp(a, b, op); if (o !== undefined) return o;
     const verb = { "-": "subtract", "*": "multiply", "/": "divide" }[op] ?? "add";
     if (a instanceof Qty && b instanceof Qty) {
       if (op === "+" || op === "-" || op === "%") return mkQty(arith(a.amt, qtyAlign(a, b, verb), op), a.unit);
@@ -576,7 +595,8 @@ const $rt = (() => {
     }
     if (recv instanceof Qty) {
       switch (name) {
-        case "amount": return recv.amt;
+        case "amount": case "cardinal": return recv.amt;
+        case "index": if (isOrd(recv)) return sub(recv.amt, 1n); break;
         case "unit": return unitShow(recv.unit);
         case "to": return convertTo(recv, toStr(a0()));
         case "abs": return mkQty(builtinMethod(recv.amt, "abs", []), recv.unit);
@@ -587,6 +607,7 @@ const $rt = (() => {
     if (isNum(recv)) {
       switch (name) {
         case "withUnit": return qty(recv, toStr(a0()));
+        case "ordinal": return qty(asInt(recv), "ord");
         case "toDecimal": return toDec(recv);
         case "toFloat": return asF64(recv);
         case "toInt": return BigInt(Math.trunc(asF64(recv)));
@@ -791,6 +812,8 @@ const $rt = (() => {
       case "readFile": try { return ok(require("fs").readFileSync(toStr(a(0)), "utf8")); } catch (e) { return err(e.message); }
       case "writeFile": try { require("fs").writeFileSync(toStr(a(0)), toStr(a(1))); return ok(null); } catch (e) { return err(e.message); }
       case "args": return process.argv.slice(2);
+      case "exec": { const r = require("child_process").spawnSync(toStr(a(0)), iter(a(1)).map(toStr), { stdio: "inherit" }); return BigInt(r.status ?? 127); }
+      case "mkdirs": try { require("fs").mkdirSync(toStr(a(0)), { recursive: true }); return ok(null); } catch (e) { return err(e.message); }
       case "exit": process.exit(Number(asInt(a(0))));
       case "eprintln": process.stderr.write(toStr(a(0)) + "\n"); return null;
       case "TRUE": return true;

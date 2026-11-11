@@ -1,0 +1,4 @@
+tests/errors/ordinal_suffix.chim:1:22: error: ordinal 21 is written 21st
+    1 | fun main() { val d = 21th }
+      |                      ^^^^
+1 error found

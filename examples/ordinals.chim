@@ -1,0 +1,18 @@
+// Ordinals are a "physical" unit: positions (1st, 2nd, 3rd…) form an affine space over
+// cardinal numbers (counts) — like points vs. vectors, or timestamps vs. durations.
+
+fun podium(names: Vec<String>, place) = "${names[place.index] ?: "?"} finished $place"
+
+fun main() {
+  val first = 1st
+  val third = 3rd
+  println("$first, 2nd, $third, ${11th}, ${22nd}, ${101st}, ${112th}")
+  println(third + 2)                 // position + count = position (5th)
+  println(third - first)             // position - position = count (2)
+  println(10th - 3)                  // 7th
+  println(3rd < 10th)
+  val runners = ["Ada", "Bob", "Cy", "Di"]
+  println(podium(runners, 2nd))
+  println("Bob is at index ${2nd.index}; ${4.ordinal()} is the last place")
+  for i in 0..3 { println("place ${1st + i}") }
+}

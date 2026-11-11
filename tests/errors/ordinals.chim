@@ -1,0 +1,5 @@
+fun main() {
+  val a = 1st + 3rd
+  val b = 2nd * 3
+  val c = 3rd + 1.5
+}

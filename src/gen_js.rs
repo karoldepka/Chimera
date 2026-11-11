@@ -331,6 +331,11 @@ impl<'a> J<'a> {
     fn call(&mut self, callee: &Expr, args: &[Arg]) -> String {
         match &callee.kind {
             ExprKind::Ident(n) if !self.is_local(n) && !self.field(n) => {
+                if n == "embedFile" {
+                    if let [Arg { value: Expr { kind: ExprKind::Str(segs), .. }, .. }] = args {
+                        if let [StrSeg::Lit(path)] = segs.as_slice() { return lit(&crate::embed_file(path)); }
+                    }
+                }
                 if n == "callNext" { return if args.is_empty() { "$next($args)".into() } else { format!("$next({})", self.args_list(args)) }; }
                 if self.method(n) { let a = self.args_list(args); return format!("$rt.callSelf($this, {}, {})", lit(n), a); }
                 if let Some(f) = self.d.funs.get(n).copied() { let v = self.ordered(&f.params, args); return format!("{}({})", fname(n), v.join(", ")); }
