@@ -1,0 +1,183 @@
+// Static types and units of measure (self-hosted). Port of the `Ty` part of src/sema.rs and src/units.rs.
+
+enum Ty {
+  YAny, YUnit, YInt, YFloat, YDecimal,
+  YQty(unit: Vec<Any>),              // a number with a unit: [[name, exponent]]
+  YStr, YBool, YNil,
+  YNullable(inner: Ty),
+  YRecord(fields: Vec<RField>),
+  YClass(name: String),
+  YEnum(name: String),
+  YVec(elem: Ty),
+  YMap(key: Ty, value: Ty),
+  YFn(params: Vec<Ty>, ret: Ty),
+  YLit(text: String),
+  YUnion(options: Vec<Ty>),
+  YSheet, YAtom
+}
+
+data class RField(val name: String, val ty: Ty, val optional: Bool, val readonly: Bool)
+
+/// The variant of a type as a string; "?" for nil (no type).
+fun kind(t: Any): String = match t {
+  YAny => "Any"
+  YUnit => "Unit"
+  YInt => "Int"
+  YFloat => "Float"
+  YDecimal => "Decimal"
+  YQty(_) => "Qty"
+  YStr => "Str"
+  YBool => "Bool"
+  YNil => "Nil"
+  YNullable(_) => "Nullable"
+  YRecord(_) => "Record"
+  YClass(_) => "Class"
+  YEnum(_) => "Enum"
+  YVec(_) => "Vec"
+  YMap(_, _) => "Map"
+  YFn(_, _) => "Fn"
+  YLit(_) => "Lit"
+  YUnion(_) => "Union"
+  YSheet => "Sheet"
+  YAtom => "Atom"
+  _ => "?"
+}
+
+fun isPlainNum(t: Any): Bool = ["Int", "Float", "Decimal"].contains(kind(t))
+
+fun showTy(t: Any): String = match t {
+  YAny => "Any"
+  YUnit => "Unit"
+  YInt => "Int"
+  YFloat => "Float"
+  YDecimal => "Decimal"
+  YQty(u) => "Quantity<${unitShow(u)}>"
+  YStr => "String"
+  YBool => "Bool"
+  YNil => "Nil"
+  YNullable(i) => "${showTy(i)}?"
+  YRecord(fs) => "{ " & fs.map(|f| "${if f.readonly { "readonly " } else { "" }}${f.name}${if f.optional { "?" } else { "" }}: ${showTy(f.ty)}").join(", ") & " }"
+  YClass(n) => n
+  YEnum(n) => n
+  YVec(e) => "Vec<${showTy(e)}>"
+  YMap(k, v) => "Map<${showTy(k)}, ${showTy(v)}>"
+  YFn(ps, r) => "(${ps.map(|p| showTy(p)).join(", ")}) -> ${showTy(r)}"
+  YLit(s) => "\"$s\""
+  YUnion(ts) => ts.map(|x| showTy(x)).join(" | ")
+  YSheet => "Sheet"
+  YAtom => "Atom"
+  _ => "?"
+}
+
+fun nullable(t: Any): Any {
+  val k = kind(t)
+  if k == "Nullable" || k == "Any" || k == "Nil" { t } else { YNullable(t) }
+}
+
+fun nonNull(t: Any): Any = if kind(t) == "Nullable" { t.inner } else { t }
+
+fun joinTy(a: Any, b: Any): Any {
+  if a == b { return a }
+  val ka = kind(a)
+  val kb = kind(b)
+  if ka == "Nil" { return nullable(b) }
+  if kb == "Nil" { return nullable(a) }
+  if (ka == "Int" && kb == "Float") || (ka == "Float" && kb == "Int") || (ka == "Decimal" && kb == "Float") || (ka == "Float" && kb == "Decimal") { return YFloat }
+  if (ka == "Int" && kb == "Decimal") || (ka == "Decimal" && kb == "Int") { return YDecimal }
+  if ka == "Qty" && kb == "Qty" && unitCompatible(a.unit, b.unit) { return a }
+  if (ka == "Lit" && kb == "Str") || (ka == "Str" && kb == "Lit") || (ka == "Lit" && kb == "Lit") { return YStr }
+  YAny
+}
+
+// ---------------------------------------------------------------- units of measure
+
+/// [unit, base unit]: units with the same base convert into each other
+fun unitBases(): Vec<Any> = [
+  ["W", "W"], ["kW", "W"], ["MW", "W"], ["GW", "W"],
+  ["Wh", "Wh"], ["kWh", "Wh"], ["MWh", "Wh"],
+  ["mm", "m"], ["cm", "m"], ["m", "m"], ["km", "m"],
+  ["mg", "g"], ["g", "g"], ["kg", "g"], ["t", "g"],
+  ["ms", "s"], ["s", "s"], ["min", "s"], ["h", "s"], ["d", "s"],
+  ["mL", "L"], ["L", "L"],
+  ["B", "B"], ["KB", "B"], ["MB", "B"], ["GB", "B"]
+]
+
+fun unitBase(u: Any): Any {
+  val c = unitBases().find(|x| x[0] == u)
+  if c == nil { nil } else { c[1] }
+}
+
+fun unitSimple(u: Any): Any = if u.count() == 1 && u[0][1] == 1 { u[0][0] } else { nil }
+
+fun unitSame(a: Any, b: Any): Bool = a.count() == b.count() && a.all(|x| b.any(|y| y[0] == x[0] && y[1] == x[1]))
+
+/// Units that can be added/compared: identical, or simple units with the same base (kW + W).
+fun unitCompatible(a: Any, b: Any): Bool {
+  if unitSame(a, b) { return true }
+  val x = unitSimple(a)
+  val y = unitSimple(b)
+  if x == nil || y == nil { return false }
+  unitBase(x) != nil && unitBase(x) == unitBase(y)
+}
+
+fun unitCombine(a: Any, b: Any, sign: Int): Any {
+  var out = a
+  for e in b {
+    var found = false
+    var k = 0
+    while k < out.count() {
+      if out[k][0] == e[0] && !found { out = out.assoc(k, [e[0], out[k][1] + e[1] * sign]); found = true }
+      k += 1
+    }
+    if !found { out = out.push([e[0], e[1] * sign]) }
+  }
+  out.filter(|x| x[1] != 0)
+}
+
+fun unitShow(u: Any): String {
+  val num = u.filter(|x| x[1] > 0).map(|x| if x[1] == 1 { x[0] } else { "${x[0]}^${x[1]}" })
+  val den = u.filter(|x| x[1] < 0).map(|x| if x[1] == -1 { x[0] } else { "${x[0]}^${0 - x[1]}" })
+  val n = if num.isEmpty() { "1" } else { num.join("·") }
+  if den.isEmpty() { n } else { "$n/${den.join("/")}" }
+}
+
+// ---------------------------------------------------------------- flow helpers
+
+fun diverges(e: Expr): Bool = match e.kind {
+  EBlock(b) => match b.stmts.last() {
+    SReturn(_, _) => true
+    SBreak(_) => true
+    SContinue(_) => true
+    _ => false
+  }
+  ECall(c, _) => match c.kind {
+    EIdent(n) => n == "panic"
+    _ => false
+  }
+  _ => false
+}
+
+fun pickNil(a: Expr, b: Expr): Any = match a.kind {
+  EIdent(n) => match b.kind {
+    ENil => n
+    _ => nil
+  }
+  _ => nil
+}
+
+/// For `x != nil` returns [x, nil]; for `x == nil` returns [nil, x] (names narrowed in the then / else branch).
+fun nilCheck(c: Expr): Vec<Any> {
+  match c.kind {
+    EBinary(op, l, r) => {
+      val n = pickNil(l, r) ?: pickNil(r, l)
+      if n != nil {
+        if op == "!=" { return [n, nil] }
+        if op == "==" { return [nil, n] }
+      }
+      if op == "&&" { return [nilCheck(l)[0] ?: nilCheck(r)[0], nil] }
+      if op == "||" { return [nil, nilCheck(l)[1] ?: nilCheck(r)[1]] }
+    }
+    _ => {}
+  }
+  [nil, nil]
+}
