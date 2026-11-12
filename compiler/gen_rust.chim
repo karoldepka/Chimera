@@ -544,7 +544,9 @@ class Gen(val info: Info, val d: Decls, val baseDir: String) {
       pattern(a.pat, mv, pa)
       pushScope(pa.binds.map(|b| b[0]))
       val bs = pa.binds.map(|b| "let mut ${rid(b[0])}: Value = ${b[1]}; ").join("")
-      val body = expr(a.body)
+      // a labeled block as a break value is parenthesised: `break 'a ('b: { .. })`
+      val bv = expr(a.body)
+      val body = if bv.startsWith("'") { "($bv)" } else { bv }
       val inner = if a.guard != nil { "${bs}if rt::truthy(${rf(a.guard!!)}) { break $lbl $body; }" } else { "${bs}break $lbl $body;" }
       popScope()
       if pa.conds.isEmpty() { out = out.push("{ $inner } ") } else { out = out.push("if ${pa.conds.join(" && ")} { $inner } ") }
