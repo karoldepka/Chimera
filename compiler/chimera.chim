@@ -1,14 +1,15 @@
 // ============================================================================
-// chimera — the Chimera compiler, written in Chimera.
+// chimera: the Chimera compiler, written in Chimera.
 //
-// Stage 0 (the Rust compiler in src/) compiles this into stage 1; stage 1 compiles
-// itself into stage 2; tests/bootstrap.sh checks that all of them emit identical Rust.
+// Compiles Chimera to Rust (default) or JavaScript. It compiles itself: the Rust it
+// generates for these sources is checked in under bootstrap/ as the seed that builds
+// the compiler from a clean checkout (see build.sh and tests/bootstrap.sh).
 //
 //   chimera check  <file.chim>
-//   chimera emit   <file.chim>              print the generated Rust
-//   chimera build  <file.chim> [-o <dir>]   write + cargo-build a Rust crate
-//   chimera run    <file.chim> [-o <dir>]   build and run
-//   chimera tokens <file.chim>              dump the token stream
+//   chimera build  <file.chim> [--target rust|js] [-o <out>]
+//   chimera run    <file.chim> [--target rust|js] [-o <out>] [-- args...]
+//   chimera emit   <file.chim> [--target rust|js]
+//   chimera tokens <file.chim>
 // ============================================================================
 
 import "ast.chim"
@@ -21,8 +22,10 @@ import "common.chim"
 import "native.chim"
 import "contracts.chim"
 import "gen_rust.chim"
+import "gen_js.chim"
 
 fun runtimeSource(): String = embedFile("../runtime/rt.rs")
+fun jsRuntimeSource(): String = embedFile("../runtime/rt.js")
 
 // ---------------------------------------------------------------- source loading
 data class Segment(val start: Int, val end: Int, val file: String, val text: String)
@@ -99,8 +102,7 @@ fun render(d: Diag, segs: Vec<Segment>): String {
 fun failWith(ds: Vec<Diag>, segs: Vec<Segment>) {
   var out: Vec<String> = []
   for d in ds { out = out.push(render(d, segs)) }
-  print(out.join(""))
-  eprintln("${ds.count()} error${if ds.count() == 1 { "" } else { "s" }} found")
+  eprintln(out.join("") & "${ds.count()} error${if ds.count() == 1 { "" } else { "s" }} found")
   exit(1)
 }
 
@@ -161,7 +163,7 @@ fun buildRust(c: Compiled, out: String, stem: String): String {
 }
 
 fun usage() {
-  eprintln("Chimera compiler (self-hosted)\n\nUSAGE:\n  chimera check <file.chim>\n  chimera build <file.chim> [-o <dir>]\n  chimera run   <file.chim> [-o <dir>] [-- args...]\n\n  --contracts all|pre|none   contract monitoring level (default: all)\n  chimera emit  <file.chim>\n  chimera tokens <file.chim>")
+  eprintln("Chimera compiler\n\nUSAGE:\n  chimera check  <file.chim>\n  chimera build  <file.chim> [--target rust|js] [-o <out>]\n  chimera run    <file.chim> [--target rust|js] [-o <out>] [-- args...]\n  chimera emit   <file.chim> [--target rust|js]     print the generated code\n  chimera tokens <file.chim>                        dump the token stream\n\n  --contracts all|pre|none   contract monitoring level (default: all)")
   exit(2)
 }
 
@@ -173,12 +175,14 @@ fun main() {
   var out: String? = nil
   var rest: Vec<String> = []
   var level = "all"
+  var target = "rust"
   var k = 2
   while k < argv.count() {
     val a = argv[k]!!
     if a == "-o" { out = argv[k + 1]; k += 2 }
     else if a == "--target" || a == "-t" {
-      if argv[k + 1] != "rust" { eprintln("error: the self-hosted compiler only has the Rust backend"); exit(2) }
+      target = argv[k + 1] ?: ""
+      if target != "rust" && target != "js" { eprintln("error: unknown target '$target' (use rust or js)"); exit(2) }
       k += 2
     }
     else if a == "--contracts" {
@@ -200,9 +204,18 @@ fun main() {
   }
   val c = compile(file, level)
   if cmd == "check" { println("$file: ok"); return nil }
-  if cmd == "emit" { print(generateRust(c.decls, c.info, c.baseDir)); return nil }
+  if cmd == "emit" {
+    print(if target == "js" { generateJs(c.decls, c.info, c.baseDir) } else { generateRust(c.decls, c.info, c.baseDir) })
+    return nil
+  }
   if cmd == "build" || cmd == "run" {
     val stem = stemOf(file)
+    if target == "js" {
+      val path = out ?: "$stem.js"
+      writeOrDie(path, jsRuntimeSource() & "\n" & generateJs(c.decls, c.info, c.baseDir))
+      if cmd == "build" { eprintln("wrote $path"); return nil }
+      exit(exec("node", [path] + rest))
+    }
     val bin = buildRust(c, out ?: "${stem}_rs", stem)
     if cmd == "build" { eprintln("wrote $bin"); return nil }
     exit(exec(bin, rest))

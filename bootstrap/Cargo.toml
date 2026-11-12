@@ -1,0 +1,13 @@
+# Bootstrap seed: the Rust that the Chimera compiler generates for its own sources
+# (compiler/*.chim). Regenerate with scripts/update-seed.sh; do not edit by hand.
+[package]
+name = "chimera"
+version = "0.2.0"
+edition = "2021"
+
+[dependencies]
+
+[profile.release]
+overflow-checks = true
+
+[workspace]
